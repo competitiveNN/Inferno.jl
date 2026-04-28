@@ -43,6 +43,7 @@ module ModelCPU
 using LinearAlgebra
 using Statistics
 using LoopVectorization
+using ..CommonOps
 using ..QuantsCPU
 using ..ArrowLake
 using ..QuantizedKernels
@@ -1120,85 +1121,8 @@ function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hid
  end
 end
 
-function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
- # Handle temperature=0 (greedy/argmax sampling)
- if temperature == 0.0f0
- return argmax(logits)
- end
- 
- # Apply temperature
- if temperature != 1.0f0
- logits = logits ./ temperature
- end
-    
-    # Apply top-k filtering
-    if top_k > 0
-        sorted_indices = sortperm(logits, rev=true)
-        keep_indices = Set(sorted_indices[1:min(top_k, length(logits))])
-        for i in 1:length(logits)
-            if i ∉ keep_indices
-                logits[i] = -Inf32
-            end
-        end
-    end
-    
-    # Apply softmax
-    max_logit = maximum(logits)
-    exp_logits = exp.(logits .- max_logit)
-    probs = exp_logits ./ sum(exp_logits)
-    
-    # Apply top-p (nucleus) filtering
-    if top_p < 1.0f0
-        sorted_indices = sortperm(probs, rev=true)
-        cumsum = 0.0f0
-        keep_indices = Set{Int}()
-        for idx in sorted_indices
-            push!(keep_indices, idx)
-            cumsum += probs[idx]
-            if cumsum >= top_p
-                break
-            end
-        end
-        # Zero out probabilities for tokens not in top-p
-        for i in 1:length(probs)
-            if i ∉ keep_indices
-                probs[i] = 0.0f0
-            end
-        end
-        # Renormalize
-        total = sum(probs)
-        if total > 0.0f0
-            probs ./= total
-        end
-    end
-    
-    # Apply minimum probability threshold (relative to max probability)
-    if min_p > 0.0f0
-        max_prob = maximum(probs)
-        threshold = max_prob * min_p
-        for i in 1:length(probs)
-            if probs[i] < threshold
-                probs[i] = 0.0f0
-            end
-        end
-        total = sum(probs)
-        if total > 0.0f0
-            probs ./= total
-        end
-    end
-    
-    # Sample from distribution
-    r = rand(Float32)
-    cumsum = 0.0f0
-    for i in 1:length(probs)
-        cumsum += probs[i]
-        if r <= cumsum
-            return i
-        end
-    end
-    return length(probs)
-end
-
+# Use CommonOps.softmax_sample instead of local copy
+const softmax_sample = CommonOps.softmax_sample
 function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
     if penalty == 0.0f0
         return
@@ -1210,19 +1134,8 @@ function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int
     end
 end
 
-function apply_repetition_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
-    if penalty != 1.0f0
-        for (tokid, _count) in token_counts
-            if 1 <= tokid <= length(logits)
-                if logits[tokid] > 0
-                    logits[tokid] /= penalty
-                else
-                    logits[tokid] *= penalty
-                end
-            end
-        end
-    end
-end
+# Use CommonOps.apply_repetition_penalty! instead of local copy
+const apply_repetition_penalty! = CommonOps.apply_repetition_penalty!
 
 # --- Generation Functions ---
 
@@ -1932,5 +1845,63 @@ end
 # Include Flash Attention and Speculative Decoding
 include("FlashAttention.jl")
 include("SpeculativeDecoding.jl")
+
+# --- Model Display ---
+
+function Base.show(io::IO, ::MIME"text/plain", model::QwenModelCPU)
+    config = model.config
+    arch = config.architecture
+
+    println(io, "QwenModelCPU (CPU backend)")
+    println(io, "├─ Architecture: ", arch)
+    println(io, "├─ Hidden size: ", config.hidden_size)
+    println(io, "├─ Layers: ", config.num_hidden_layers)
+    println(io, "├─ Attention heads: ", config.num_attention_heads, " (KV: ", config.num_key_value_heads, ")")
+    println(io, "├─ Head dim: ", config.head_dim)
+    println(io, "├─ Intermediate size: ", config.intermediate_size)
+    println(io, "├─ Vocab size: ", config.vocab_size)
+    println(io, "├─ Max positions: ", config.max_position_embeddings)
+    println(io, "├─ RoPE theta: ", config.rope_theta)
+    println(io, "├─ Full attention interval: ", config.full_attention_interval)
+    if hasfield(typeof(config), :partial_rotary_factor)
+        println(io, "├─ Partial rotary factor: ", config.partial_rotary_factor)
+    end
+
+    # SSM params
+    if hasfield(typeof(config), :ssm_inner_size) && config.ssm_inner_size > 0
+        println(io, "├─ SSM inner size: ", config.ssm_inner_size)
+        println(io, "├─ SSM state size: ", config.ssm_state_size)
+        println(io, "├─ SSM group count: ", config.ssm_group_count)
+        println(io, "├─ SSM time step rank: ", config.ssm_time_step_rank)
+        println(io, "├─ SSM conv kernel: ", config.ssm_conv_kernel)
+    end
+
+    # MoE
+    if hasfield(typeof(config), :num_experts) && config.num_experts > 0
+        println(io, "├─ Experts: ", config.num_experts, " (top-k: ", config.num_experts_per_tok, ")")
+    end
+
+    # MLA (DeepSeek)
+    if hasfield(typeof(config), :q_lora_rank) && config.q_lora_rank > 0
+        println(io, "├─ MLA Q-LoRA rank: ", config.q_lora_rank)
+        println(io, "├─ MLA KV-LoRA rank: ", config.kv_lora_rank)
+        println(io, "├─ MLA QK RoPE head dim: ", config.qk_rope_head_dim)
+        println(io, "├─ MLA QK NoPE head dim: ", config.qk_nope_head_dim)
+        println(io, "├─ MLA V head dim: ", config.v_head_dim)
+    end
+
+    # MTP
+    if model.mtp !== nothing
+        println(io, "├─ MTP head: enabled")
+    end
+
+    # Precision
+    bf16_status = config.use_bf16_weights ? "enabled" : "disabled"
+    println(io, "└─ BF16 weights: ", bf16_status)
+end
+
+function Base.show(io::IO, model::QwenModelCPU)
+    show(io, MIME"text/plain"(), model)
+end
 
 end # module

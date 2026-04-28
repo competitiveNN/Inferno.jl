@@ -1557,4 +1557,59 @@ function reset_states!(model::QwenModel)
     end
 end
 
+# --- Model Display ---
+
+function Base.show(io::IO, ::MIME"text/plain", model::QwenModel)
+    config = model.config
+    arch = config.architecture
+
+    # Header
+    println(io, "QwenModel (GPU backend)")
+    println(io, "├─ Architecture: ", arch)
+    println(io, "├─ Hidden size: ", config.hidden_size)
+    println(io, "├─ Layers: ", config.num_hidden_layers)
+    println(io, "├─ Attention heads: ", config.num_attention_heads, " (KV: ", config.num_key_value_heads, ")")
+    println(io, "├─ Head dim: ", config.head_dim)
+    println(io, "├─ Intermediate size: ", config.intermediate_size)
+    println(io, "├─ Vocab size: ", config.vocab_size)
+    println(io, "├─ Max positions: ", config.max_position_embeddings)
+    println(io, "├─ RoPE theta: ", config.rope_theta)
+    println(io, "├─ Full attention interval: ", config.full_attention_interval)
+
+    # SSM params (only relevant for Qwen3.5-style SSM models)
+    if hasfield(typeof(config), :ssm_inner_size) && config.ssm_inner_size > 0
+        println(io, "├─ SSM inner size: ", config.ssm_inner_size)
+        println(io, "├─ SSM state size: ", config.ssm_state_size)
+        println(io, "├─ SSM group count: ", config.ssm_group_count)
+        println(io, "├─ SSM time step rank: ", config.ssm_time_step_rank)
+        println(io, "├─ SSM conv kernel: ", config.ssm_conv_kernel)
+    end
+
+    # MoE
+    if hasfield(typeof(config), :num_experts) && config.num_experts > 0
+        println(io, "├─ Experts: ", config.num_experts, " (top-k: ", config.num_experts_per_tok, ")")
+    end
+
+    # MLA (DeepSeek)
+    if hasfield(typeof(config), :q_lora_rank) && config.q_lora_rank > 0
+        println(io, "├─ MLA Q-LoRA rank: ", config.q_lora_rank)
+        println(io, "├─ MLA KV-LoRA rank: ", config.kv_lora_rank)
+        println(io, "├─ MLA QK RoPE head dim: ", config.qk_rope_head_dim)
+        println(io, "├─ MLA QK NoPE head dim: ", config.qk_nope_head_dim)
+        println(io, "├─ MLA V head dim: ", config.v_head_dim)
+    end
+
+    # Device info
+    try
+        device_str = string(oneAPI.device())
+        println(io, "└─ Device: ", device_str)
+    catch
+        println(io, "└─ Device: unknown (oneAPI error)")
+    end
+end
+
+function Base.show(io::IO, model::QwenModel)
+    show(io, MIME"text/plain"(), model)
+end
+
 end # module

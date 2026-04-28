@@ -828,4 +828,68 @@ function generate_text_gemma4(model::Gemma4Model, tok, prompt::String;
     return String(take!(generated_text))
 end
 
+# --- Model Display ---
+
+function Base.show(io::IO, ::MIME"text/plain", model::Gemma4Model)
+    config = model.config
+
+    println(io, "Gemma4Model (CPU backend)")
+    println(io, "├─ Model: Gemma-4")
+    println(io, "├─ Hidden size: ", config.hidden_size)
+    println(io, "├─ Layers: ", config.num_layers)
+    println(io, "├─ Q heads: ", config.num_q_heads)
+    println(io, "├─ KV heads: ", config.num_kv_heads, " (global: ", config.num_global_kv_heads, ")")
+    println(io, "├─ Head dim (sliding): ", config.head_dim)
+    println(io, "├─ Head dim (global): ", config.global_head_dim)
+    println(io, "├─ Intermediate size: ", config.intermediate_size)
+    println(io, "├─ Double-wide intermediate: ", config.double_wide_intermediate)
+    println(io, "├─ Vocab size: ", config.vocab_size)
+    if hasfield(typeof(config), :vocab_size_per_layer_input)
+        println(io, "├─ Vocab per layer input: ", config.vocab_size_per_layer_input)
+    end
+    println(io, "├─ Max seq len: ", config.max_seq_len)
+    println(io, "├─ Sliding window: ", config.sliding_window)
+    println(io, "├─ RMS norm eps: ", config.rms_norm_eps)
+    println(io, "├─ Final logit softcapping: ", config.final_logit_softcapping)
+    println(io, "├─ Attention logit softcapping: ", config.attention_logits_softcapping)
+    println(io, "├─ Embed scale: ", config.embed_scale)
+    println(io, "├─ Per-layer input scale: ", config.per_layer_input_scale)
+    println(io, "├─ Per-layer projection scale: ", config.per_layer_model_projection_scale)
+    if hasfield(typeof(config), :hidden_size_per_layer_input)
+        println(io, "├─ PLI size: ", config.hidden_size_per_layer_input)
+    end
+    if hasfield(typeof(config), :num_kv_shared_layers)
+        println(io, "├─ KV shared layers: ", config.num_kv_shared_layers)
+        if config.num_kv_shared_layers > 0 && hasfield(typeof(config), :first_kv_shared_layer)
+            println(io, "│  └─ First shared layer index (0-based): ", config.first_kv_shared_layer)
+        end
+    end
+    if hasfield(typeof(config), :attention_k_eq_v)
+        println(io, "├─ Attention k_eq_v: ", config.attention_k_eq_v)
+    end
+    if hasfield(typeof(config), :sliding_rope_theta)
+        println(io, "├─ Sliding RoPE theta: ", config.sliding_rope_theta)
+    end
+    if hasfield(typeof(config), :full_rope_theta)
+        println(io, "├─ Full RoPE theta: ", config.full_rope_theta)
+    end
+    if hasfield(typeof(config), :full_partial_rotary_factor)
+        println(io, "├─ Full partial rotary factor: ", config.full_partial_rotary_factor)
+    end
+    if hasfield(typeof(config), :tie_word_embeddings)
+        println(io, "├─ Tie word embeddings: ", config.tie_word_embeddings)
+    end
+
+    # Count layer types if available
+    if hasfield(typeof(config), :layer_types)
+        sliding_count = count(==("sliding_attention"), config.layer_types)
+        full_count = count(==("full_attention"), config.layer_types)
+        println(io, "└─ Layer composition: ", sliding_count, " sliding, ", full_count, " full")
+    end
+end
+
+function Base.show(io::IO, model::Gemma4Model)
+    show(io, MIME"text/plain"(), model)
+end
+
 end # module Gemma4

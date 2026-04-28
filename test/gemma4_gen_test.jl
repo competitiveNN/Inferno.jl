@@ -1,23 +1,48 @@
+#!/usr/bin/env julia
+# Gemma4 CPU Inference — Comprehensive Test
+# Tests: greedy generation, sampling, multiple prompts
+using Pkg; Pkg.activate(".")
+using Printf
 using Inferno
-using Inferno.Gemma4
-using Inferno.Gemma4Loader
-using Inferno.Tokenizer: encode, decode
 
-model, tok = Gemma4Loader.load_gemma4("test/models/gemma-4-E2B-it"; max_seq_len=512)
+function main()
+    model, tok = Inferno.Gemma4Loader.load_gemma4("test/models/gemma-4-E2B-it")
+    config = model.config
 
-# Chat template for Gemma4
-prompt = "<start_of_turn>user\nWhat is 2 + 2?<end_of_turn>\n<start_of_turn>model\n"
-println("Prompt: ", repr(prompt))
+    encode_fn(t, s) = Inferno.Gemma4Loader.encode(t, s)
+    decode_fn(ids) = Inferno.Gemma4Loader.decode(tok, ids)
 
-# Encode
-token_ids = encode(tok, prompt)
-println("Encoded: ", length(token_ids), " tokens, first 10: ", token_ids[1:min(10, length(token_ids))])
+    println("\n=== Greedy Generation Tests ===")
+    prompts = [
+        "What is 2 + 2 ?",
+        "The capital of France is",
+        "What is the largest planet in our solar system?",
+    ]
+    
+    for prompt in prompts
+        result = Inferno.Gemma4.generate_text_gemma4(model, tok, prompt;
+            max_tokens=128,
+            temperature=0.0f0,
+            top_k=0,
+            repetition_penalty=1.0f0,
+            encode_fn=encode_fn,
+            decode_fn=decode_fn)
+        println("\n  Q: $prompt")
+        println("  A: $result")
+    end
 
-# Generate
-stop_tokens = Set{Int}([107])  # <end_of_turn> (0-indexed) = 108 (1-indexed)
-generated = Gemma4.generate(model, token_ids, 50; temperature=0.7f0, top_k=50, stop_tokens=stop_tokens)
+    println("\n\n=== Sampling Generation Test (temp=0.7, top_k=40) ===")
+    result = Inferno.Gemma4.generate_text_gemma4(model, tok, "Explain what recursion is in simple terms.";
+        max_tokens=128,
+        temperature=0.7f0,
+        top_k=40,
+        repetition_penalty=1.1f0,
+        encode_fn=encode_fn,
+        decode_fn=decode_fn)
+    println("\n  Q: Explain what recursion is in simple terms.")
+    println("  A: $result")
+    
+    println()
+end
 
-# Decode
-output_text = decode(tok, generated)
-println("Generated tokens: ", generated[1:min(20, length(generated))])
-println("Generated text: ", output_text)
+main()

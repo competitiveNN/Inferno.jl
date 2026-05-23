@@ -8,6 +8,7 @@ using ..Gemma4:
     PerLayerInput, KVCacheG4, init_kv_cache, precompute_rope, compute_store_kv_layers
 using ..Tokenizer: BPETokenizer, encode, decode
 using ..Safetensors: parse_safetensors, get_tensor, SafetensorsFile, load_hf_tokenizer
+using ..LoaderCPU: load_safetensors_model
 
 function load_gemma4(model_dir::String; max_seq_len::Int=2048)
     println("Loading Gemma4 model from $model_dir")

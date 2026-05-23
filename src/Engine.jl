@@ -2,7 +2,6 @@ module Engine
 
 using ..Model
 using ..Tokenizer
-using ..oneAPI
 using Random
 
 export generate, generate_stream, sample, stream_to_stdout
@@ -322,6 +321,115 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
             end
         end
     end
+end
+
+# =======================================================================
+# generate_stream for Gemma4 GPU models
+# =======================================================================
+using ..Gemma4
+using ..Gemma4GPU
+using ..Gemma4GPUKernels
+using ..Qwen35GPU
+
+function generate_stream(model::Gemma4GPU.Gemma4ModelGPU, tok::Tokenizer.BPETokenizer, prompt::String;
+    max_tokens::Int=512,
+    temperature::Float16=Float16(0.7),
+    top_p::Float16=Float16(0.95),
+    top_k::Int=0,
+    presence_penalty::Float16=Float16(0.0),
+    repetition_penalty::Float16=Float16(1.0),
+    min_p::Float16=Float16(0.0),
+    stop_token::Union{Int,Nothing}=nothing,
+    gc_interval::Int=0)
+
+    # Gemma4 chat format
+    end_turn = 107  # <turn|> (1-indexed)
+    chat_prompt = "<|turn>user\n$(prompt)<turn|><|turn>model\n"
+    
+    # Encode prompt
+    tokens = Tokenizer.encode(tok, chat_prompt)
+    
+    # Add BOS token (3 in 1-indexed)
+    if isempty(tokens) || tokens[1] != 3
+        pushfirst!(tokens, 3)
+    end
+    
+    if isempty(tokens)
+        return Channel{String}(0) do chan
+            close(chan)
+        end
+    end
+
+    token_counts = Dict{Int,Int}()
+    for t in tokens
+        token_counts[t] = get(token_counts, t, 0) + 1
+    end
+
+    return Channel{String}(32) do chan
+        try
+            # Initialize KV cache for Gemma4 GPU
+            cache = produce_empty_kv_cache_gemma4(model)
+            
+            # Process prompt tokens
+            logits = Gemma4GPU.forward_gpu(model, tokens, 0, cache)
+            curr_pos = length(tokens)
+
+            # Sample first token
+            logits_vec = vec(collect(logits[:, end]))
+            apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
+            apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
+            last_token = mask_and_sample(logits_vec, [tok.eos_id, end_turn], temperature, top_p, top_k; min_p=min_p)
+
+            token_str = Tokenizer.decode(tok, [last_token])
+            put!(chan, token_str)
+            token_counts[last_token] = get(token_counts, last_token, 0) + 1
+
+            # Generate loop
+            for step in 1:(max_tokens-1)
+                stop_id = stop_token === nothing ? tok.eos_id : stop_token
+                if last_token == stop_id || last_token == end_turn
+                    break
+                end
+
+                logits = Gemma4GPU.forward_gpu(model, [last_token], curr_pos, cache)
+                curr_pos += 1
+
+                logits_vec = vec(collect(logits[:, 1]))
+                apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
+                apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
+                last_token = mask_and_sample(logits_vec, [tok.eos_id, end_turn], temperature, top_p, top_k; min_p=min_p)
+
+                token_str = Tokenizer.decode(tok, [last_token])
+                put!(chan, token_str)
+                token_counts[last_token] = get(token_counts, last_token, 0) + 1
+            end
+
+            oneAPI.synchronize()
+
+        catch e
+            if !(e isa InterruptException)
+                @error "ERROR during Gemma4 GPU stream" exception=(e, catch_backtrace())
+            end
+        finally
+            try
+                GC.gc(true)
+            catch
+            end
+            try
+                close(chan)
+            catch
+            end
+        end
+    end
+end
+
+# Helper to create empty KV cache for Gemma4 GPU
+function produce_empty_kv_cache_gemma4(model::Gemma4GPU.Gemma4ModelGPU)
+    # Gemma4 uses sliding window for most layers, shared KV for some
+    config = model.config
+    sw = config.sliding_window
+    cache = Gemma4GPU.init_kv_cache_gemma4(config)
+    return cache
 end
 
 function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;

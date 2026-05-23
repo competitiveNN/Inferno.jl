@@ -18,13 +18,23 @@ include("QuantizedKernels.jl")
 include("GGUF.jl")
 include("Model.jl")
 include("BF16Support.jl")
+include("CommonOps.jl")
 include("ModelCPU.jl")
 include("Tokenizer.jl")
 include("Loader.jl")
 include("Safetensors.jl")
+include("Qwen3.jl")
+include("Qwen35.jl")
+include("Jamba.jl")
 include("LoaderCPU.jl")
 include("Gemma4.jl")
 include("Gemma4Loader.jl")
+include("GPUCommon.jl")
+include("FusedKernels.jl")
+include("Qwen35GPU.jl")
+include("Gemma4GPUKernels.jl")
+include("Gemma4GPU.jl")
+include("Gemma4GPULoader.jl")
 include("Engine.jl")
 include("Server.jl")
 include("Generate.jl")
@@ -33,6 +43,11 @@ using .QuantsData
 using .Dequant
 using .Gemma4
 using .Gemma4Loader
+using .Gemma4GPU
+using .Gemma4GPULoader
+using .GPUCommon
+using .FusedKernels
+using .Qwen35GPU
 using .Engine
 using .AMXBF16
 using .ArrowLake
@@ -40,16 +55,19 @@ using .QuantsCPU
 using .QuantMV
 using .GGUF
 using .Model
-using .BF16Support
+using .BF16Support: set_inference_precision!, get_inference_precision, should_use_bf16
 using .ModelCPU
+using .Jamba
 using .Tokenizer
 using .Loader
 using .LoaderCPU
 using .Safetensors
+using .Qwen3
 using .Server
 using .Generate
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
+export load_qwen3_cpu, generate_stream_cpu
 export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample, BF16Support
 export generate_text
 export chat!, start_chat, Message, build_prompt
@@ -497,10 +515,23 @@ elseif chosen_backend == :cpu
  rep_f32 = Float32(repetition_penalty)
  min_p_f32 = Float32(min_p)
 stop_tokens = stop_token === nothing ? Set{Int}() : Set([stop_token])
-  return ModelCPU.stream_to_stdout_cpu(model, tok, prompt;
-  max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
-  presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32, stop_tokens=stop_tokens, show_tps=show_tps, io=io,
-  interrupt_check=interrupt_check)
+
+    # Dispatch based on model type
+    if model isa Gemma4.Gemma4Model
+        # Gemma4 CPU generation
+        return Gemma4.stream_to_stdout_gemma4_cpu(model, tok, prompt;
+            max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
+            presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32,
+            stop_tokens=stop_tokens, show_tps=show_tps, io=io,
+            interrupt_check=interrupt_check)
+    else
+        # Qwen CPU generation
+        return ModelCPU.stream_to_stdout_cpu(model, tok, prompt;
+            max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
+            presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32,
+            stop_tokens=stop_tokens, show_tps=show_tps, io=io,
+            interrupt_check=interrupt_check)
+    end
     else
         error("Unsupported backend: $(backend). Use :cpu or :gpu.")
     end

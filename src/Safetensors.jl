@@ -255,7 +255,14 @@ function load_safetensors_model(model_path::String)
  end
  config = JSON3.read(read(config_path, String))
     
-    # Parse text_config
+    # Auto-detect Gemma4 models and route to parent module's loader
+    config_text = read(config_path, String)
+    if occursin("\"gemma4\"", config_text) || occursin("\"model_type\": \"gemma4\"", config_text)
+        @info "Detected Gemma4 model architecture, routing to Gemma4 loader"
+        return Main.Inferno.Gemma4Loader.load_gemma4(model_dir)
+    end
+    
+    # Parse text_config and continue with Qwen loading
     text_config = get(config, "text_config", Dict{String, Any}())
     
     # Create QwenConfigCPU
@@ -764,13 +771,13 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  end
  end
  
- # Default norms
- if q_norm_w === nothing
- q_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
- end
- if k_norm_w === nothing
- k_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
- end
+# Default norms
+if q_norm_w === nothing
+ q_norm_w = ones(Float32, config.head_dim) .+ 1.0f0
+end
+if k_norm_w === nothing
+ k_norm_w = ones(Float32, config.head_dim) .+ 1.0f0
+end
  
  q_norm = ModelCPU.RMSNormCPU(q_norm_w, config.rms_norm_eps)
  k_norm = ModelCPU.RMSNormCPU(k_norm_w, config.rms_norm_eps)

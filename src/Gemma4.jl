@@ -3,6 +3,7 @@ module Gemma4
 using LinearAlgebra
 using Printf
 using ..CommonOps
+using ..Tokenizer
 
 # ============================================================
 # Gemma4 CPU Inference Implementation
@@ -777,6 +778,73 @@ end
 
 # Use CommonOps.apply_repetition_penalty! instead of local copy
 const apply_repetition_penalty! = CommonOps.apply_repetition_penalty!
+
+# =======================================================================
+# stream_to_stdout for Gemma4 (CPU backend)
+# =======================================================================
+"""
+    stream_to_stdout_gemma4_cpu(model::Gemma4Model, tok, prompt::String; kwargs...)
+
+Stream generation to stdout for Gemma4 CPU backend.
+Convenient wrapper matching the stream_to_stdout_cpu API.
+"""
+function stream_to_stdout_gemma4_cpu(model::Gemma4Model, tok, prompt::String;
+    max_tokens::Int=256,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.95f0,
+    top_k::Int=40,
+    presence_penalty::Float32=0.0f0,  # Not used by Gemma4
+    repetition_penalty::Float32=1.1f0,
+    min_p::Float32=0.0f0,  # Not used by Gemma4
+    stop_tokens::Set{Int}=Set{Int}(),
+    show_tps::Bool=false,
+    io::IO=stdout,
+    interrupt_check::Function=() -> false)
+
+    # Gemma4 chat format
+    end_turn = 107  # <turn|>
+    chat_prompt = "<|turn>user\n$(prompt)<turn|><|turn>model\n"
+    
+    # Encode prompt
+    prompt_tokens = Tokenizer.encode(tok, chat_prompt)
+    
+    # Add BOS token (3 in 1-indexed)
+    if isempty(prompt_tokens) || prompt_tokens[1] != 3
+        pushfirst!(prompt_tokens, 3)
+    end
+    
+    # Default stop tokens
+    if isempty(stop_tokens)
+        stop_tokens = Set{Int}([end_turn, 2])  # <turn|> and EOS
+    end
+    
+# Generate stream
+    char_count = 0
+    t0 = time()
+    end_turn = 107  # <turn|>
+    
+    decode_fn = (tokens) -> Tokenizer.decode(tok, tokens)
+    
+    for token_str in generate_stream_gemma4(model, prompt_tokens, decode_fn;
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+        top_k=top_k, repetition_penalty=repetition_penalty, stop_tokens=stop_tokens, max_context=4096)
+        
+        if interrupt_check()
+            break
+        end
+        
+        print(io, token_str)
+        flush(io)
+        char_count += length(token_str)
+    end
+    
+    if show_tps
+        elapsed = time() - t0
+        println(io)
+        @printf(io, "[t/s] %.2f tokens/s - ~%d chars in %.2fs\n", 
+            char_count / elapsed, char_count, elapsed)
+    end
+end
 
 function generate_text_gemma4(model::Gemma4Model, tok, prompt::String;
     max_tokens::Int=256,

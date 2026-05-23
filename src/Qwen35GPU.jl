@@ -295,10 +295,9 @@ function ssm_forward!(model::Qwen35GPUModel, layer::DecoderLayer, hidden::oneVec
  mul!(alpha, ssm.alpha_w, hidden)
  mul!(beta_all, ssm.beta_w, hidden)
 
- # dt = sigmoid(dt_bias + alpha)
- dt_buf = view(model.qkv_buf, n_v+1:n_v+n_v)
- fused_ssm_gate_sigmoid!(dt_buf, ssm.ssm_dt_bias, alpha)
- dt = dt_buf
+ # dt = sigmoid(dt_bias + alpha) — reuse alpha buffer (alpha is dead after this)
+ fused_ssm_gate_sigmoid!(alpha, ssm.ssm_dt_bias, alpha)
+ dt = alpha
 
  # Decay = exp(-ssm_a * dt)
  decay_buf = view(model.gate_buf, 1:length(dt))

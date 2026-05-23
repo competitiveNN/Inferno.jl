@@ -16,7 +16,7 @@ export fused_ssm_gate_sigmoid!, fused_ssm_decay!
     @inbounds x[i] = x[i] * inv_norm
 end
 
-function fused_l2norm!(x::oneAPI.oneArray{Float32,1}, eps::Float32)
+function fused_l2norm!(x::AbstractArray{Float32,1}, eps::Float32)
     n = length(x)
     n == 0 && return x
     # GPU reduction via BLAS dot (no temp allocation, single kernel call)
@@ -48,9 +48,9 @@ end
 end
 
 function fused_attention_weighted_sum!(
-    attn_out::oneAPI.oneArray{Float32,1},
-    scores::oneAPI.oneArray{Float32,2},
-    v_cache::oneAPI.oneArray{Float32,2},
+    attn_out::AbstractArray{Float32,1},
+    scores::AbstractArray{Float32,2},
+    v_cache::AbstractArray{Float32,2},
     n_heads::Int, head_dim::Int, seq_len::Int, n_groups::Int
 )
     n_total = n_heads * head_dim
@@ -68,7 +68,7 @@ end
     @inbounds gate[i] = gate[i] / (1.0f0 + exp(-gate[i])) * up[i]
 end
 
-function fused_mlp_gate_mul!(gate::oneAPI.oneArray{Float32,1}, up::oneAPI.oneArray{Float32,1})
+function fused_mlp_gate_mul!(gate::AbstractArray{Float32,1}, up::AbstractArray{Float32,1})
     n = length(gate)
     n == 0 && return gate
     kernel = mlp_gate_mul_kernel!
@@ -84,7 +84,7 @@ end
     @inbounds out[i] = x[i] / (1.0f0 + exp(-x[i])) * gate[i]
 end
 
-function fused_silu_gate_mul!(out::oneAPI.oneArray{Float32,1}, x::oneAPI.oneArray{Float32,1}, gate::oneAPI.oneArray{Float32,1})
+function fused_silu_gate_mul!(out::AbstractArray{Float32,1}, x::AbstractArray{Float32,1}, gate::AbstractArray{Float32,1})
     n = length(out)
     n == 0 && return out
     kernel = silu_gate_mul_kernel!
@@ -101,7 +101,7 @@ end
     @inbounds out[i] = 1.0f0 / (1.0f0 + exp(-(bias[i] + x[i])))
 end
 
-function fused_ssm_gate_sigmoid!(out::oneAPI.oneArray{Float32,1}, bias::oneAPI.oneArray{Float32,1}, x::oneAPI.oneArray{Float32,1})
+function fused_ssm_gate_sigmoid!(out::AbstractArray{Float32,1}, bias::AbstractArray{Float32,1}, x::AbstractArray{Float32,1})
     n = length(out)
     n == 0 && return out
     kernel = ssm_gate_sigmoid_kernel!
@@ -118,7 +118,7 @@ end
     @inbounds out[i] = exp(-a[i] * dt[i])
 end
 
-function fused_ssm_decay!(out::oneAPI.oneArray{Float32,1}, a::oneAPI.oneArray{Float32,1}, dt::oneAPI.oneArray{Float32,1})
+function fused_ssm_decay!(out::AbstractArray{Float32,1}, a::AbstractArray{Float32,1}, dt::AbstractArray{Float32,1})
     n = length(out)
     n == 0 && return out
     kernel = ssm_decay_kernel!

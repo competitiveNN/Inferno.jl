@@ -13,6 +13,8 @@ using oneAPI
 export rmsnorm_kernel!, gelu_kernel!, residual_add_kernel!, apply_rope_kernel!
 export softmax_kernel!, matmul_vec_kernel!, silu_kernel!, sigmoid_kernel!
 export batched_attention_scores_kernel!, batched_softmax_kernel!, batched_ssm_state_kernel!
+export rmsnorm_gpu!, gelu_gpu!, residual_add_gpu!, apply_rope_gpu!, softmax_gpu!, silu_gpu!, sigmoid_gpu!
+export batched_attention_scores!, batched_softmax!, batched_ssm_state_update!, batched_ssm_output_sum!
 
 # ============================================================
 # RMSNorm Kernel
@@ -227,8 +229,8 @@ Compute attention scores for ALL heads and positions in parallel.
  end
 end
 
-function batched_attention_scores!(scores::oneArray{Float32,2}, q::oneArray{Float32,1}, 
-                                   k_cache::oneArray{Float32,2}, n_heads::Int, head_dim::Int, 
+function batched_attention_scores!(scores::AbstractArray{Float32,2}, q::AbstractArray{Float32,1}, 
+                                   k_cache::AbstractArray{Float32,2}, n_heads::Int, head_dim::Int, 
                                    seq_len::Int, n_groups::Int)
  n_total = n_heads * seq_len
  kernel = batched_attention_scores_kernel!
@@ -284,7 +286,7 @@ Uses online softmax computation with per-row max/sum.
  end
 end
 
-function batched_softmax!(scores::oneArray{Float32,2}, n_heads::Int, seq_len::Int)
+function batched_softmax!(scores::AbstractArray{Float32,2}, n_heads::Int, seq_len::Int)
  n_total = n_heads * seq_len
  kernel = batched_softmax_kernel!
  kernel(scores, n_heads, seq_len; ndrange=n_total)
@@ -338,8 +340,8 @@ State update: h[t] = decay * h[t-1] + beta * x^T
  end
 end
 
-function batched_ssm_state_update!(h_state::oneArray{Float32,3}, decay::oneArray{Float32,1},
-                                   beta::oneArray{Float32,1}, x_conv::oneArray{Float32,1},
+function batched_ssm_state_update!(h_state::AbstractArray{Float32,3}, decay::AbstractArray{Float32,1},
+                                   beta::AbstractArray{Float32,1}, x_conv::AbstractArray{Float32,1},
                                    n_v::Int, head_v::Int, head_k::Int)
  n_total = n_v * head_v * head_k
  kernel = batched_ssm_state_kernel!
@@ -377,7 +379,7 @@ Sum h_state over k_dim for each v_head and output to y_out.
  end
 end
 
-function batched_ssm_output_sum!(y_out::oneArray{Float32,1}, h_state::oneArray{Float32,3},
+function batched_ssm_output_sum!(y_out::AbstractArray{Float32,1}, h_state::AbstractArray{Float32,3},
                                  n_v::Int, head_v::Int, head_k::Int)
  n_total = n_v * head_v
  kernel = batched_ssm_output_kernel!

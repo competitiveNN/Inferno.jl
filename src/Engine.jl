@@ -468,4 +468,25 @@ function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, p
     println()
 end
 
+
+# ------------------------------------------------------------
+# GPU dispatch for Qwen35GPU (Intel Arc)
+# ------------------------------------------------------------
+function generate_stream(model::Qwen35GPU.Qwen35GPUModel, tok::Tokenizer.BPETokenizer, prompt::String;
+    max_tokens::Int=512,
+    temperature::Float16=Float16(0.7),
+    top_p::Float16=Float16(0.95),
+    top_k::Int=0,
+    presence_penalty::Float16=Float16(0.0),
+    repetition_penalty::Float16=Float16(1.0),
+    min_p::Float16=Float16(0.0),
+    stop_token::Union{Int,Nothing}=nothing,
+    gc_interval::Int=0)
+    return Qwen35GPU.generate_stream(model, tok, prompt;
+        max_tokens=max_tokens,
+        temperature=Float32(temperature),
+        top_p=Float32(top_p),
+        top_k=top_k)
+end
+
 end # module

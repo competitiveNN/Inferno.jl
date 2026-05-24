@@ -116,9 +116,10 @@ mutable struct Qwen35GPUModel
  gate_buf::oneVector{Float32}
  up_buf::oneVector{Float32}
  down_buf::oneVector{Float32}
- ssm_out_buf::oneVector{Float32}
- score_buf::oneMatrix{Float32}
- device::oneAPI.oneL0.ZeDevice
+\tssm_out_buf::oneVector{Float32}
+\tscore_buf::oneMatrix{Float32}
+\tlogits_buf::oneVector{Float32}
+\tdevice::oneAPI.oneL0.ZeDevice
 end
 
 # ============================================================
@@ -369,53 +370,101 @@ function forward_gpu!(model::Qwen35GPUModel, token_ids::Vector{Int}, start_pos::
   model.hidden .= model.residual .+ mlp_out
  end
 
- rmsnorm_gpu!(model.norm_buf, model.hidden, model.final_norm_w, cfg.rms_norm_eps)
- mul!(model.hidden, model.lm_head, model.norm_buf)
+\trmsnorm_gpu!(model.norm_buf, model.hidden, model.final_norm_w, cfg.rms_norm_eps)
+\t# Use pre-allocated logits buffer (vocab_size, not hidden_size)
+\tmul!(model.logits_buf, model.lm_head, model.norm_buf)
 
- return Array(Float32.(model.hidden))
+\treturn Array(Float32.(model.logits_buf))
 end
 
+# ============================================================
+# Model state reset
+# ============================================================
+function reset_model!(model::Qwen35GPUModel)
+    for k in model.kv_cache_k
+        fill!(k, 0.0f0)
+    end
+    for v in model.kv_cache_v
+        fill!(v, 0.0f0)
+    end
+    for layer in model.layers
+        if !layer.is_attention && !isnothing(layer.ssm)
+            fill!(layer.ssm.conv_state, 0.0f0)
+            fill!(layer.ssm.h_state, 0.0f0)
+        end
+    end
+    return model
+end
+
+# ============================================================
 # ============================================================
 # Generation (streaming)
 # ============================================================
 function generate_stream(model::Qwen35GPUModel, tok::BPETokenizer, prompt::String;
  max_tokens::Int=100, temperature::Float32=0.0f0,
  top_p::Float32=0.0f0, top_k::Int=0)
- prompt_ids = encode(tok, prompt)
- output_words = String[]
- pos = 0
+    return Channel{String}(32) do chan
+        prompt_ids = encode(tok, prompt)
+        token_buf  = Int[0]
 
- for step in 1:max_tokens
-  token = if step == 1 && length(prompt_ids) > 0
-   prompt_ids[1]
-  else
-   last_token
-  end
+        reset_model!(model)
+        pos = 0
+        logits = nothing
 
-  logits = forward_gpu!(model, [token], pos)
-  pos += 1
+        # Prime KV caches with full prompt
+        for token in prompt_ids
+            token_buf[1] = token
+            logits = forward_gpu!(model, token_buf, pos)
+            pos += 1
+        end
 
-  if temperature == 0.0f0
-   last_token = argmax(logits)
-  else
-   scaled = logits ./ temperature
-   m = maximum(scaled)
-   exp_vals = exp.(scaled .- m)
-   probs = exp_vals ./ sum(exp_vals)
-   last_token = sample(probs)
-  end
+        # No prompt or no generation requested
+        if isempty(prompt_ids) || max_tokens <= 0 || logits === nothing
+            return
+        end
 
-  word = decode(tok, [last_token])
-  push!(output_words, word)
-  print(word)
-  flush(stdout)
+        # First generated token from the last prompt logits
+        if temperature == 0.0f0
+            last_token = argmax(logits)
+        else
+            scaled = logits ./ temperature
+            m = maximum(scaled)
+            exp_vals = exp.(scaled .- m)
+            probs = exp_vals ./ sum(exp_vals)
+            last_token = sample(probs)
+        end
 
-  if last_token == 151643 || last_token == 0
-   break
-  end
- end
+        word = decode(tok, [last_token])
+        put!(chan, word)
 
- return join(output_words)
+        if last_token == 151643 || last_token == 0
+            return
+        end
+
+        # Continue generating
+        for _ in 1:max_tokens - 1
+            token_buf[1] = last_token
+            logits = forward_gpu!(model, token_buf, pos)
+            pos += 1
+
+            if temperature == 0.0f0
+                last_token = argmax(logits)
+            else
+                scaled = logits ./ temperature
+                m = maximum(scaled)
+                exp_vals = exp.(scaled .- m)
+                probs = exp_vals ./ sum(exp_vals)
+                last_token = sample(probs)
+            end
+
+            word = decode(tok, [last_token])
+            put!(chan, word)
+
+            if last_token == 151643 || last_token == 0
+                break
+            end
+        end
+    end
 end
 
 function sample(probs::Vector{Float32})
@@ -621,8 +670,10 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
  conv_ch = d_inner + 2 * n_k * head_k
 
  max_buf = max(h * 4, conv_ch + d_inner, cfg.intermediate_size * 3)
+ v = cfg.vocab_size
 
  hidden = oneVector{Float32}(undef, h)
+ logits_buf = oneVector{Float32}(undef, v)
  residual = oneVector{Float32}(undef, h)
  norm_buf = oneVector{Float32}(undef, h)
  qkv_buf = oneVector{Float32}(undef, max_buf)
@@ -638,7 +689,7 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
   cos_gpu, sin_gpu,
   kv_cache_k, kv_cache_v, 0,
   hidden, residual, norm_buf, qkv_buf, attn_out,
-  gate_buf, up_buf, down_buf, ssm_out_buf, score_buf,
+  gate_buf, up_buf, down_buf, ssm_out_buf, score_buf, logits_buf,
   devs[gpu_idx]
  )
 

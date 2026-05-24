@@ -118,6 +118,14 @@ mutable struct Qwen35GPUModel
  down_buf::oneVector{Float32}
 \tssm_out_buf::oneVector{Float32}
 \tscore_buf::oneMatrix{Float32}
+    q_buf::oneVector{Float32}
+    k_buf::oneVector{Float32}
+    v_buf::oneVector{Float32}
+    xz_buf::oneVector{Float32}
+    gate_ssm_buf::oneVector{Float32}
+    alpha_buf::oneVector{Float32}
+    beta_buf::oneVector{Float32}
+    out_buf::oneVector{Float32}
 \tlogits_buf::oneVector{Float32}
 \tdevice::oneAPI.oneL0.ZeDevice
 end
@@ -211,10 +219,10 @@ function attention_forward!(model::Qwen35GPUModel, layer::DecoderLayer, layer_id
  n_kv = cfg.num_key_value_heads
  n_groups = n_heads ÷ n_kv
 
- # QKV projections
- q = view(model.qkv_buf, 1:n_heads * head_dim)
- k = view(model.qkv_buf, n_heads * head_dim + 1:(n_heads + n_kv) * head_dim)
- v = view(model.qkv_buf, (n_heads + n_kv) * head_dim + 1:(n_heads + 2 * n_kv) * head_dim)
+ # QKV projections (dedicated buffers to avoid CPU fallback in mul!)
+ q = model.q_buf
+ k = model.k_buf
+ v = model.v_buf
 
  mul!(q, attn.q_w, hidden)
  mul!(k, attn.k_w, hidden)
@@ -255,9 +263,8 @@ function attention_forward!(model::Qwen35GPUModel, layer::DecoderLayer, layer_id
  fused_attention_weighted_sum!(model.attn_out, scores, v_cache, n_heads, head_dim, seq_len, n_groups)
 
  # Output projection
- out = view(model.qkv_buf, 1:h)
- mul!(out, attn.o_w, model.attn_out)
- return out
+ mul!(model.out_buf, attn.o_w, model.attn_out)
+ return model.out_buf
 end
 
 # ============================================================
@@ -276,13 +283,13 @@ function ssm_forward!(model::Qwen35GPUModel, layer::DecoderLayer, hidden::oneVec
  conv_channels = ssm.conv_channels
 
  # Combined in-projection
- xz = view(model.qkv_buf, 1:conv_channels + d_inner)
+ xz = model.xz_buf
  mul!(xz, ssm.in_proj, hidden)
  x_conv = view(xz, 1:conv_channels)
  z = view(xz, conv_channels+1:conv_channels+d_inner)
 
  # Gate
- gate_out = view(model.gate_buf, 1:d_inner)
+ gate_out = model.gate_ssm_buf
  mul!(gate_out, ssm.gate_proj, hidden)
  silu_gpu!(gate_out, gate_out)
 
@@ -291,8 +298,8 @@ function ssm_forward!(model::Qwen35GPUModel, layer::DecoderLayer, hidden::oneVec
  ssm.conv_state[:, end] .= x_conv
 
  # Alpha/beta projections
- alpha = view(model.qkv_buf, 1:n_v)
- beta_all = view(model.qkv_buf, n_v+1:n_v + n_v * head_v)
+ alpha = model.alpha_buf
+ beta_all = model.beta_buf
  mul!(alpha, ssm.alpha_w, hidden)
  mul!(beta_all, ssm.beta_w, hidden)
 
@@ -317,9 +324,8 @@ function ssm_forward!(model::Qwen35GPUModel, layer::DecoderLayer, hidden::oneVec
  fused_silu_gate_mul!(y_gated, y_all, gate_out)
 
  # Output projection
- out = view(model.qkv_buf, 1:h)
- mul!(out, ssm.ssm_out, y_gated)
- return out
+ mul!(model.out_buf, ssm.ssm_out, y_gated)
+ return model.out_buf
 end
 
 # ============================================================
@@ -330,17 +336,14 @@ function mlp_forward!(model::Qwen35GPUModel, layer::DecoderLayer, hidden::oneVec
  h = model.config.hidden_size
  int_size = model.config.intermediate_size
 
- gate = view(model.gate_buf, 1:int_size)
- up = view(model.up_buf, 1:int_size)
+ # MLP gate/up/down — operate directly on pre-allocated full buffers
+ mul!(model.gate_buf, mlp.gate_w, hidden)
+ mul!(model.up_buf, mlp.up_w, hidden)
 
- mul!(gate, mlp.gate_w, hidden)
- mul!(up, mlp.up_w, hidden)
+ fused_mlp_gate_mul!(model.gate_buf, model.up_buf)
 
- fused_mlp_gate_mul!(gate, up)
-
- out = view(model.down_buf, 1:h)
- mul!(out, mlp.down_w, gate)
- return out
+ mul!(model.down_buf, mlp.down_w, model.gate_buf)
+ return model.down_buf
 end
 
 # ============================================================
@@ -684,12 +687,33 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
  ssm_out_buf = oneVector{Float32}(undef, d_inner)
  score_buf = oneMatrix{Float32}(undef, cfg.num_attention_heads, max_seq_len)
 
+ # Pre-allocated buffers for mul! destinations (avoid CPU fallback on SubArray)
+ q_buf = oneVector{Float32}(undef, cfg.num_attention_heads * cfg.head_dim)
+ k_buf = oneVector{Float32}(undef, cfg.num_key_value_heads * cfg.head_dim)
+ v_buf = oneVector{Float32}(undef, cfg.num_key_value_heads * cfg.head_dim)
+ ssm_idx = findfirst(l -> l.ssm !== nothing, layers)
+ if ssm_idx !== nothing
+     ssm_buf_ref = layers[ssm_idx].ssm
+     xz_buf = oneVector{Float32}(undef, ssm_buf_ref.conv_channels + ssm_buf_ref.d_inner)
+     gate_ssm_buf = oneVector{Float32}(undef, ssm_buf_ref.d_inner)
+     alpha_buf = oneVector{Float32}(undef, ssm_buf_ref.num_v_heads)
+     beta_buf = oneVector{Float32}(undef, ssm_buf_ref.num_v_heads * ssm_buf_ref.head_v_dim)
+ else
+     xz_buf = oneVector{Float32}(undef, 1)
+     gate_ssm_buf = oneVector{Float32}(undef, 1)
+     alpha_buf = oneVector{Float32}(undef, 1)
+     beta_buf = oneVector{Float32}(undef, 1)
+ end
+ out_buf = oneVector{Float32}(undef, cfg.hidden_size)
+
  model = Qwen35GPUModel(
   cfg, embed, layers, final_norm_w, lm_head,
   cos_gpu, sin_gpu,
   kv_cache_k, kv_cache_v, 0,
   hidden, residual, norm_buf, qkv_buf, attn_out,
-  gate_buf, up_buf, down_buf, ssm_out_buf, score_buf, logits_buf,
+  gate_buf, up_buf, down_buf, ssm_out_buf, score_buf,
+  q_buf, k_buf, v_buf, xz_buf, gate_ssm_buf, alpha_buf, beta_buf, out_buf,
+  logits_buf,
   devs[gpu_idx]
  )
 

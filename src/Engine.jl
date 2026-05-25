@@ -489,4 +489,38 @@ function generate_stream(model::Qwen35GPU.Qwen35GPUModel, tok::Tokenizer.BPEToke
         top_k=top_k)
 end
 
+function generate(model::Qwen35GPU.Qwen35GPUModel, tok::Tokenizer.BPETokenizer, prompt::String;
+    max_tokens::Int=512,
+    temperature::Float16=Float16(0.7),
+    top_p::Float16=Float16(0.95),
+    top_k::Int=0,
+    presence_penalty::Float16=Float16(0.0),
+    repetition_penalty::Float16=Float16(1.0),
+    min_p::Float16=Float16(0.0),
+    stop_token::Union{Int,Nothing}=nothing,
+    gc_interval::Int=0)
+    stream = generate_stream(model, tok, prompt; max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, presence_penalty=presence_penalty, repetition_penalty=repetition_penalty, min_p=min_p, stop_token=stop_token, gc_interval=gc_interval)
+    res = String[]
+    for token_str in stream
+        push!(res, token_str)
+    end
+    return join(res)
+end
+
+function stream_to_stdout(model::Qwen35GPU.Qwen35GPUModel, tok::Tokenizer.BPETokenizer, prompt::String;
+    max_tokens::Int=512,
+    temperature::Float16=Float16(0.7),
+    top_p::Float16=Float16(0.95),
+    top_k::Int=0,
+    presence_penalty::Float16=Float16(0.0),
+    repetition_penalty::Float16=Float16(1.0),
+    min_p::Float16=Float16(0.0),
+    gc_interval::Int=0)
+    stream = generate_stream(model, tok, prompt; max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, presence_penalty=presence_penalty, repetition_penalty=repetition_penalty, min_p=min_p, gc_interval=gc_interval)
+    for token_str in stream
+        print(token_str)
+    end
+    println()
+end
+
 end # module

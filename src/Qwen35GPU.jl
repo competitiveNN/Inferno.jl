@@ -377,7 +377,7 @@ function forward_gpu!(model::Qwen35GPUModel, token_ids::Vector{Int}, start_pos::
 \t# Use pre-allocated logits buffer (vocab_size, not hidden_size)
 \tmul!(model.logits_buf, model.lm_head, model.norm_buf)
 
-\treturn Array(Float32.(model.logits_buf))
+	return model.logits_buf
 end
 
 # ============================================================
@@ -428,13 +428,13 @@ function generate_stream(model::Qwen35GPUModel, tok::BPETokenizer, prompt::Strin
 
         # First generated token from the last prompt logits
         if temperature == 0.0f0
-            last_token = argmax(logits)
+            last_token = argmax(Array(logits))
         else
             scaled = logits ./ temperature
             m = maximum(scaled)
             exp_vals = exp.(scaled .- m)
             probs = exp_vals ./ sum(exp_vals)
-            last_token = sample(probs)
+            last_token = sample(Array(probs))
         end
 
         word = decode(tok, [last_token])

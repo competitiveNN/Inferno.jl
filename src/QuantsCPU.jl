@@ -280,44 +280,58 @@ end
 
 Dequantize a single Q6_K block (256 elements).
 
-Q6_K block structure (208 bytes):
-- ql: 128 bytes (low bits)
-- qh: 64 bytes (high bits)  
-- scales: 16 bytes
-- d: 2 bytes (Float16)
+Q6_K block structure (210 bytes):
+- ql: 128 bytes (low 4 bits)
+- qh: 64 bytes (high 2 bits)
+- scales: 16 bytes (int8, 16 scales for 16 groups of 16 elements)
+- d: 2 bytes (Float16 super-block scale)
+
+Algorithm (from llama.cpp ggml-quants.c):
+- Process 2 super-groups of 128 elements each
+- Each super-group has 4 sub-groups of 32 elements
+- For each of 32 positions within a sub-group:
+  - Extract 4 quantized values from the same ql byte and same qh byte
+  - q1 = (ql[l] & 0xF) | ((qh[l] >> 0) & 3) << 4
+  - q2 = (ql[l+32] & 0xF) | ((qh[l] >> 2) & 3) << 4
+  - q3 = (ql[l] >> 4) | ((qh[l] >> 4) & 3) << 4
+  - q4 = (ql[l+32] >> 4) | ((qh[l] >> 6) & 3) << 4
+  - Subtract 32 from each for signed representation
+  - Scale by d * scales[is + offset]
 """
 function dequantize_q6_k_block(data::Vector{UInt8}, block_offset::Int)
     ql = @view data[block_offset:block_offset+127]
     qh = @view data[block_offset+128:block_offset+191]
-    scales_data = @view data[block_offset+192:block_offset+207]
+    scales = @view data[block_offset+192:block_offset+207]
     d = Float32(reinterpret(Float16, data[block_offset+208:block_offset+209])[1])
     
     values = MVector{256, Float32}(undef)
     
-    for j in 0:255
-        # Q6_K uses a more complex bit packing
-        # Each element is 6 bits, with interleaved low/high bits
-        block_idx = j ÷ 128
-        inner_idx = j % 128
+    # First super-group (n=0, scales indices 0-7)
+    for l in 0:31
+        is_idx = l ÷ 16  # 0 or 1, selects which pair of scales to use
+        q1 = Int(Int8((ql[l+1] & 0x0F) | ((qh[l+1] >> 0) & 0x03) << 4)) - 32
+        q2 = Int(Int8((ql[l+33] & 0x0F) | ((qh[l+1] >> 2) & 0x03) << 4)) - 32
+        q3 = Int(Int8((ql[l+1] >> 4) | ((qh[l+1] >> 4) & 0x03) << 4)) - 32
+        q4 = Int(Int8((ql[l+33] >> 4) | ((qh[l+1] >> 6) & 0x03) << 4)) - 32
         
-        # Low 4 bits from ql
-        l = Int(ql[inner_idx + 1])
-        # High 2 bits from qh
-        h = Int((qh[inner_idx + 1] >> (2 * (j % 128))) & 0x03)
+        values[l+1] = d * Float32(Int8(scales[is_idx+1])) * q1
+        values[l+33] = d * Float32(Int8(scales[is_idx+3])) * q2
+        values[l+65] = d * Float32(Int8(scales[is_idx+5])) * q3
+        values[l+97] = d * Float32(Int8(scales[is_idx+7])) * q4
+    end
+    
+    # Second super-group (n=128, scales indices 8-15)
+    for l in 0:31
+        is_idx = l ÷ 16  # 0 or 1
+        q1 = Int(Int8((ql[l+65] & 0x0F) | ((qh[l+33] >> 0) & 0x03) << 4)) - 32
+        q2 = Int(Int8((ql[l+97] & 0x0F) | ((qh[l+33] >> 2) & 0x03) << 4)) - 32
+        q3 = Int(Int8((ql[l+65] >> 4) | ((qh[l+33] >> 4) & 0x03) << 4)) - 32
+        q4 = Int(Int8((ql[l+97] >> 4) | ((qh[l+33] >> 6) & 0x03) << 4)) - 32
         
-        # Combine and sign-extend
-        raw_val = (l & 0x0f) | (h << 4)
-        
-        # Sign extend from 6 bits
-        if raw_val >= 32
-            raw_val -= 64
-        end
-        
-        # Scale
-        scale_idx = j ÷ 16 + 1
-        scale = Float32(scales_data[scale_idx])
-        
-        values[j + 1] = d * scale * Float32(raw_val)
+        values[l+129] = d * Float32(Int8(scales[is_idx+9])) * q1
+        values[l+161] = d * Float32(Int8(scales[is_idx+11])) * q2
+        values[l+193] = d * Float32(Int8(scales[is_idx+13])) * q3
+        values[l+225] = d * Float32(Int8(scales[is_idx+15])) * q4
     end
     
     return NTuple{256, Float32}(values)
@@ -607,38 +621,47 @@ function dequantize_q5_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8
 end
 
 function dequantize_q6_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8}, block_offset::Int)
-    # Q6_K block structure (210 bytes):
-    # - ql: 128 bytes (QK_K/2)
-    # - qh: 64 bytes (QK_K/4)
-    # - scales: 16 bytes (QK_K/16)
-    # - d: 2 bytes (ggml_half)
-    # Total = 128 + 64 + 16 + 2 = 210 bytes
+    # Q6_K block structure (210 bytes, 256 elements):
+    # - ql: 128 bytes (low 4 bits of each quant)
+    # - qh: 64 bytes (high 2 bits of each quant)  
+    # - scales: 16 bytes (int8, 1 per 16 elements = 16 scales total)
+    # - d: 2 bytes (Float16 super-block scale)
+    # 
+    # Dequantization formula (same as CUDA kernel):
+    # - 2 super-groups of 128 elements each
+    # - Each super-group has 16 scales, used at indices 0,2,4,6,8,10,12,14
+    # - 6-bit quant = (ql_low_4_bits) | ((qh_shifted) << 4)
+    # - signed = quant - 32
+    # - output = d * scale * signed
     
     ql = @view data[block_offset:block_offset+127]
     qh = @view data[block_offset+128:block_offset+191]
     sc = reinterpret(Int8, data[block_offset+192:block_offset+207])
     d = Float32(reinterpret(Float16, data[block_offset+208:block_offset+209])[1])
     
-    # Process 2 super-groups
+    # Process 2 super-groups of 128 elements each
     for n_sg in 0:1
         ql_sg = @view ql[(n_sg * 64 + 1):(n_sg * 64 + 64)]
         qh_sg = @view qh[(n_sg * 32 + 1):(n_sg * 32 + 32)]
-        sc_sg = @view sc[(n_sg * 8 + 1):(n_sg * 8 + 8)]
         
         for l in 0:31
-            is_idx = l ÷ 16
+            # Scale index within super-group (0-7), scaled by 2 for even indices
+            scale_idx = 2 * (l ÷ 16)  # 0 for l=0-15, 2 for l=16-31
             
             qh_val = qh_sg[l + 1]
             
+            # Extract 4 values from this thread position (mimics CUDA kernel)
             q1 = Int8((ql_sg[l + 1] & 0x0f) | ((qh_val & 0x03) << 4)) - Int8(32)
             q2 = Int8((ql_sg[l + 32 + 1] & 0x0f) | (((qh_val >> 2) & 0x03) << 4)) - Int8(32)
             q3 = Int8((ql_sg[l + 1] >> 4) | (((qh_val >> 4) & 0x03) << 4)) - Int8(32)
             q4 = Int8((ql_sg[l + 32 + 1] >> 4) | (((qh_val >> 6) & 0x03) << 4)) - Int8(32)
             
-            out[n_sg * 128 + l + 1] = d * Float32(sc_sg[is_idx + 1]) * Float32(q1)
-            out[n_sg * 128 + l + 32 + 1] = d * Float32(sc_sg[is_idx + 2 + 1]) * Float32(q2)
-            out[n_sg * 128 + l + 64 + 1] = d * Float32(sc_sg[is_idx + 4 + 1]) * Float32(q3)
-            out[n_sg * 128 + l + 96 + 1] = d * Float32(sc_sg[is_idx + 6 + 1]) * Float32(q4)
+            # Output to 4 positions within the 128-element half-block
+            out_pos = n_sg * 128 + l
+            out[out_pos + 1] = d * Float32(sc[scale_idx + 1]) * Float32(q1)
+            out[out_pos + 33] = d * Float32(sc[scale_idx + 3]) * Float32(q2)
+            out[out_pos + 65] = d * Float32(sc[scale_idx + 5]) * Float32(q3)
+            out[out_pos + 97] = d * Float32(sc[scale_idx + 7]) * Float32(q4)
         end
     end
     

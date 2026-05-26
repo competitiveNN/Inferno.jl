@@ -1,9 +1,13 @@
 module Loader
 
-using oneAPI
 using ..GGUF
 using ..Model
 using OrderedCollections
+# GPU backend (optional)
+try
+    using oneAPI
+catch
+end
 
 export load_weights
 

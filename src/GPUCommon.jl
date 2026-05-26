@@ -14,7 +14,8 @@ export rmsnorm_kernel!, gelu_kernel!, residual_add_kernel!, apply_rope_kernel!
 export softmax_kernel!, matmul_vec_kernel!, silu_kernel!, sigmoid_kernel!
 export batched_attention_scores_kernel!, batched_softmax_kernel!, batched_ssm_state_kernel!
 export rmsnorm_gpu!, gelu_gpu!, residual_add_gpu!, apply_rope_gpu!, softmax_gpu!, silu_gpu!, sigmoid_gpu!
-export batched_attention_scores!, batched_softmax!, batched_ssm_state_update!, batched_ssm_output_sum!
+export batched_attention_scores!, batched_softmax!, batched_ssm_state_update!, batched_ssm_output_sum!, fused_attention_forward!
+export write_kv_cache_kernel!, write_kv_cache_gpu!
 
 # ============================================================
 # RMSNorm Kernel
@@ -40,12 +41,8 @@ function rmsnorm_gpu!(out::AbstractArray, x::AbstractArray, weight::AbstractArra
  n = length(x)
  if n == 0 return out end
  
- # Step 1: Compute sum of squares on CPU (fast for typical hidden sizes)
- # TODO: Replace with GPU reduction for very large n
- sum_sq = 0.0f0
- for j in 1:n
-  sum_sq += x[j] * x[j]
- end
+ # Step 1: Compute sum of squares (GPU-accelerated BLAS dot product)
+    sum_sq = dot(x, x)
  
  # Step 2: Normalize using the pre-computed sum
  kernel = rmsnorm_kernel!
@@ -263,26 +260,30 @@ Uses online softmax computation with per-row max/sum.
   s = (idx - 1) % seq_len  # 0-based position
   row_start = h * seq_len + 1
   
-  # Step 1: Find max in this row
-  max_val = -Inf32
-  for j in 0:(seq_len-1)
-   val = scores[row_start + j]
-   if val > max_val
-    max_val = val
-   end
+ # scores is stored in column-major format
+ # For head h (0-based), position j (0-based), the correct linear index is:
+ # j * n_heads + h + 1
+ 
+ # Step 1: Find max in this row
+ max_val = -Inf32
+ for j in 0:(seq_len-1)
+  val = scores[j * n_heads + h + 1]  # Corrected indexing
+  if val > max_val
+   max_val = val
   end
-  
-  # Step 2: Compute exp and sum
-  exp_val = exp(scores[idx] - max_val)
-  
-  # Step 3: Compute sum
-  sum_exp = 0.0f0
-  for j in 0:(seq_len-1)
-   sum_exp += exp(scores[row_start + j] - max_val)
-  end
-  
-  # Step 4: Normalize
-  scores[idx] = exp_val / sum_exp
+ end
+ 
+ # Step 2: Compute exp and sum
+ exp_val = exp(scores[idx] - max_val)
+ 
+ # Step 3: Compute sum
+ sum_exp = 0.0f0
+ for j in 0:(seq_len-1)
+  sum_exp += exp(scores[j * n_heads + h + 1] - max_val)  # Corrected indexing
+ end
+ 
+ # Step 4: Normalize
+ scores[idx] = exp_val / sum_exp
  end
 end
 
@@ -386,6 +387,110 @@ function batched_ssm_output_sum!(y_out::AbstractArray{Float32,1}, h_state::Abstr
  kernel(y_out, h_state, n_v, head_v, head_k; ndrange=n_total)
  @synchronize()
  return y_out
+end
+
+# ============================================================
+# KV Cache Write Kernel (Replaces CPU loop over kv_heads)
+# Single kernel dispatch for all heads
+# ============================================================
+@kernel function write_kv_cache_kernel!(k_cache, v_cache, k, v, head_dim::Int, pos::Int)
+    idx = @index(Global, Linear)
+    n = length(k)
+    if idx <= n
+        h = (idx - 1) ÷ head_dim  # 0-based head index
+        d = (idx - 1) % head_dim  # 0-based dim index
+        # Write directly - k_cache is (head_dim, pos+1) at this head
+        @inbounds k_cache[idx, pos+1] = k[idx]
+        @inbounds v_cache[idx, pos+1] = v[idx]
+    end
+end
+
+function write_kv_cache_gpu!(k_cache, v_cache, k, v, head_dim::Int, pos::Int)
+    n = length(k)
+    n == 0 && return nothing
+    kernel = write_kv_cache_kernel!
+    kernel(k_cache, v_cache, k, v, head_dim, pos; ndrange=n)
+    @synchronize()
+    return nothing
+end
+
+# ============================================================
+# Fused Attention Kernel (scores + softmax + weighted sum)
+# Combines the three attention steps into a single kernel launch.
+# Each thread handles one (head, dim) pair.
+# Recomputes scores 3x per thread to avoid intermediate buffer.
+# ============================================================
+@kernel function fused_attention_forward_kernel!(attn_out, q, k_cache, v_cache, n_heads::Int, head_dim::Int, seq_len::Int, n_groups::Int)
+    idx = @index(Global, Linear)
+    n_total = n_heads * head_dim
+    if idx <= n_total
+        h = (idx - 1) ÷ head_dim  # 0-based head index
+        d = (idx - 1) % head_dim  # 0-based dim index
+        kv_h = h ÷ n_groups
+        q_off = h * head_dim
+        k_off = kv_h * head_dim
+        v_off = kv_h * head_dim
+        
+        # Phase 1: Compute all scores for this head and track max
+        max_val = -Inf32
+        for s in 0:(seq_len-1)
+            dot_sum = 0.0f0
+            for dim in 0:(head_dim-1)
+                q_val = q[q_off + dim + 1]
+                k_val = k_cache[k_off + dim + 1, s + 1]
+                dot_sum += q_val * k_val
+            end
+            score = dot_sum / sqrt(Float32(head_dim))
+            if score > max_val
+                max_val = score
+            end
+        end
+        
+        # Phase 2: Compute sum of exp(score - max_val)
+        sum_exp = 0.0f0
+        for s in 0:(seq_len-1)
+            # Recompute score for this position
+            dot_sum = 0.0f0
+            for dim in 0:(head_dim-1)
+                q_val = q[q_off + dim + 1]
+                k_val = k_cache[k_off + dim + 1, s + 1]
+                dot_sum += q_val * k_val
+            end
+            score = dot_sum / sqrt(Float32(head_dim))
+            sum_exp += exp(score - max_val)
+        end
+        
+        # Phase 3: Compute weighted sum for this dimension
+        acc = 0.0f0
+        for s in 0:(seq_len-1)
+            # Recompute score for this position
+            dot_sum = 0.0f0
+            for dim in 0:(head_dim-1)
+                q_val = q[q_off + dim + 1]
+                k_val = k_cache[k_off + dim + 1, s + 1]
+                dot_sum += q_val * k_val
+            end
+            score = dot_sum / sqrt(Float32(head_dim))
+            prob = exp(score - max_val) / sum_exp
+            v_val = v_cache[v_off + d + 1, s + 1]
+            acc += prob * v_val
+        end
+        
+        attn_out[idx] = acc
+    end
+end
+
+function fused_attention_forward!(attn_out::AbstractArray{Float32,1}, q::AbstractArray{Float32,1}, 
+                                  k_cache::AbstractArray{Float32,2}, v_cache::AbstractArray{Float32,2},
+                                  n_heads::Int, head_dim::Int, seq_len::Int, n_groups::Int)
+    n_total = n_heads * head_dim
+    if n_total == 0
+        return attn_out
+    end
+    kernel = fused_attention_forward_kernel!
+    kernel(attn_out, q, k_cache, v_cache, n_heads, head_dim, seq_len, n_groups; ndrange=n_total)
+    @synchronize()
+    return attn_out
 end
 
 end # module GPUCommon

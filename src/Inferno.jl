@@ -543,9 +543,13 @@ using .Chat
 function __init__()
     # Register atexit hook to ensure GPU synchronization and cleanup
     # This helps prevent device lockups on unclean shutdowns
+    # However, if oneAPI is not initialized, this will fail
+    # We catch the error and ignore it
     atexit() do
         try
-            oneAPI.synchronize()
+            if isdefined(oneAPI, :default_device) && oneAPI.default_device() !== nothing
+               try oneAPI.synchronize() catch; end
+            end
         catch
         end
     end

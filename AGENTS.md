@@ -34,9 +34,9 @@ Both GGUF and Safetensors inference for Qwen3.5-0.8B-VL work with coherent gener
 - BLAS operations with pre-allocated output
 
 **Remaining:**
-- [ ] SIMD vectorization with LoopVectorization.jl
-- [ ] BLAS threading optimization (currently 10 threads)
-- [ ] MKL vs OpenBLAS comparison
+- [x] SIMD vectorization with LoopVectorization.jl
+- [x] BLAS threading optimization (currently 10 threads)
+- [x] MKL vs OpenBLAS comparison
 
 ### Phase 2.6: BF16 Support as Default
 
@@ -231,10 +231,10 @@ result, stats = generate_speculative_cpu(decoder, prompt_tokens; max_tokens=100)
 **Goal:** Support Q4, Q5, Q6, Q8 quantizations for GGUF.
 
 **Current state:** F16 (full precision) works. Need to implement:
-1. [ ] Q4_K_S / Q4_K_M dequantization
-2. [ ] Q5_K_S / Q5_K_M dequantization
-3. [ ] Q6_K dequantization
-4. [ ] Q8_0 dequantization
+1. [x] Q4_K_S / Q4_K_M dequantization
+2. [x] Q5_K_S / Q5_K_M dequantization
+3. [x] Q6_K dequantization
+4. [x] Q8_0 dequantization
 5. [ ] Test each quantization level for correctness
 
 **Reference:** llama.cpp quantization format in `ggml-common.h`
@@ -244,9 +244,9 @@ result, stats = generate_speculative_cpu(decoder, prompt_tokens; max_tokens=100)
 **Goal:** Support more SSM and attention models.
 
 **Targets:**
-1. [ ] Qwen3 (non-SSM variant)
-2. [ ] Mamba / Mamba-2
-3. [ ] RWKV
+1. [x] Qwen3 (non-SSM variant)
+2. [x] Mamba / Mamba-2
+3. [x] RWKV
 4. [ ] Jamba (mixture of SSM and attention)
 
 ---

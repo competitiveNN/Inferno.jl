@@ -12,8 +12,8 @@ using LinearAlgebra
 using KernelAbstractions
 
 # Use unified kernel library
-using ..GPUCommon: rmsnorm_gpu!, silu_gpu!, sigmoid_gpu!, batched_attention_scores!, batched_softmax!, batched_ssm_state_update!, batched_ssm_output_sum!
-using ..FusedKernels: fused_l2norm!, fused_attention_weighted_sum!, fused_mlp_gate_mul!, fused_silu_gate_mul!, fused_ssm_gate_sigmoid!, fused_ssm_decay!
+using ..GPUCommon: rmsnorm_gpu!, silu_gpu!, sigmoid_gpu!, batched_attention_scores!, batched_softmax!, batched_ssm_state_update!, batched_ssm_output_sum!, write_kv_cache_gpu!, fused_attention_forward!
+using ..FusedKernels: fused_l2norm!, fused_attention_weighted_sum!, fused_mlp_gate_mul!, fused_silu_gate_mul!, fused_ssm_gate_sigmoid!, fused_ssm_decay!, gpu_argmax!, gpu_sample!
 
 using ..GGUF
 using ..Tokenizer
@@ -115,9 +115,9 @@ mutable struct Qwen35GPUModel
  attn_out::oneVector{Float32}
  gate_buf::oneVector{Float32}
  up_buf::oneVector{Float32}
- down_buf::oneVector{Float32}
-\tssm_out_buf::oneVector{Float32}
-\tscore_buf::oneMatrix{Float32}
+    out_buf::oneVector{Float32}
+    ssm_out_buf::oneVector{Float32}
+    score_buf::oneMatrix{Float32}
     q_buf::oneVector{Float32}
     k_buf::oneVector{Float32}
     v_buf::oneVector{Float32}
@@ -125,9 +125,8 @@ mutable struct Qwen35GPUModel
     gate_ssm_buf::oneVector{Float32}
     alpha_buf::oneVector{Float32}
     beta_buf::oneVector{Float32}
-    out_buf::oneVector{Float32}
-\tlogits_buf::oneVector{Float32}
-\tdevice::oneAPI.oneL0.ZeDevice
+    logits_buf::oneVector{Float32}
+    device::oneAPI.oneL0.ZeDevice
 end
 
 # ============================================================
@@ -241,30 +240,17 @@ function attention_forward!(model::Qwen35GPUModel, layer::DecoderLayer, layer_id
  k_cache = model.kv_cache_k[layer_idx]
  v_cache = model.kv_cache_v[layer_idx]
  
- # Use GPU broadcast for copy (no CPU loop)
- for kv_head in 0:n_kv-1
-  off = kv_head * head_dim
-  k_cache[off+1:off+head_dim, pos+1] .= k[off+1:off+head_dim]
-  v_cache[off+1:off+head_dim, pos+1] .= v[off+1:off+head_dim]
- end
+    # Store KV cache - FULLY GPU (single kernel, no CPU loop)
+    write_kv_cache_gpu!(k_cache, v_cache, k, v, head_dim, pos-1)
 
- # Attention scores - FULLY GPU (batched kernel)
- seq_len = pos + 1
- scores = view(model.score_buf, 1:n_heads, 1:seq_len)
- 
- # Use batched attention scores kernel (no CPU loops!)
- batched_attention_scores!(scores, q, k_cache, n_heads, head_dim, seq_len, n_groups)
+    # Attention scores + softmax + weighted sum — fully FUSED (single kernel)
+    # This replaces batched_attention_scores! + batched_softmax! + fused_attention_weighted_sum!
+    seq_len = pos + 1
+    fused_attention_forward!(model.attn_out, q, k_cache, v_cache, n_heads, head_dim, seq_len, n_groups)
 
- # Softmax - FULLY GPU (batched kernel)
- batched_softmax!(scores, n_heads, seq_len)
-
- # Weighted sum of values — fully fused kernel (no per-head allocation)
- fill!(model.attn_out, 0.0f0)
- fused_attention_weighted_sum!(model.attn_out, scores, v_cache, n_heads, head_dim, seq_len, n_groups)
-
- # Output projection
- mul!(model.out_buf, attn.o_w, model.attn_out)
- return model.out_buf
+    # Output projection
+    mul!(model.out_buf, attn.o_w, model.attn_out)
+    return model.out_buf
 end
 
 # ============================================================
@@ -373,13 +359,10 @@ function forward_gpu!(model::Qwen35GPUModel, token_ids::Vector{Int}, start_pos::
   model.hidden .= model.residual .+ mlp_out
  end
 
-\trmsnorm_gpu!(model.norm_buf, model.hidden, model.final_norm_w, cfg.rms_norm_eps)
-\t# Use pre-allocated logits buffer (vocab_size, not hidden_size)
-\tmul!(model.logits_buf, model.lm_head, model.norm_buf)
-
-	return model.logits_buf
+ rmsnorm_gpu!(model.norm_buf, model.hidden, model.final_norm_w, cfg.rms_norm_eps)
+ mul!(model.logits_buf, model.lm_head, model.norm_buf)
+ return model.logits_buf
 end
-
 # ============================================================
 # Model state reset
 # ============================================================
@@ -428,13 +411,9 @@ function generate_stream(model::Qwen35GPUModel, tok::BPETokenizer, prompt::Strin
 
         # First generated token from the last prompt logits
         if temperature == 0.0f0
-            last_token = argmax(Array(logits))
+            last_token = gpu_argmax!(logits)
         else
-            scaled = logits ./ temperature
-            m = maximum(scaled)
-            exp_vals = exp.(scaled .- m)
-            probs = exp_vals ./ sum(exp_vals)
-            last_token = sample(Array(probs))
+            last_token = gpu_sample!(logits, temperature)
         end
 
         word = decode(tok, [last_token])
@@ -451,13 +430,9 @@ function generate_stream(model::Qwen35GPUModel, tok::BPETokenizer, prompt::Strin
             pos += 1
 
             if temperature == 0.0f0
-                last_token = argmax(logits)
+                last_token = gpu_argmax!(logits)
             else
-                scaled = logits ./ temperature
-                m = maximum(scaled)
-                exp_vals = exp.(scaled .- m)
-                probs = exp_vals ./ sum(exp_vals)
-                last_token = sample(probs)
+                last_token = gpu_sample!(logits, temperature)
             end
 
             word = decode(tok, [last_token])

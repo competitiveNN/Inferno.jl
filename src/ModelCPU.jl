@@ -50,7 +50,7 @@ using ..QuantizedKernels
 using BFloat16s
 using Printf
 
-export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU
+export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU, QuantOrFloat32
 export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu
 
 # --- Configuration ---
@@ -247,12 +247,12 @@ function update_kv_cache!(cache::KVCacheCPU, k::Matrix{Float32}, v::Matrix{Float
  # Manual copy to avoid allocation
  for h in 1:size(k, 2)
  for d in 1:size(k, 1)
- cache.k[d, h, pos + 1] = k[d, h]
+ cache.k[d, h, pos] = k[d, h]
  end
  end
  for h in 1:size(v, 2)
  for d in 1:size(v, 1)
- cache.v[d, h, pos + 1] = v[d, h]
+ cache.v[d, h, pos] = v[d, h]
  end
  end
  return cache
@@ -539,17 +539,17 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
  # 2. Update conv state (ring buffer) - use manual loop to avoid slice allocation
  # The slice assignment `m.conv_state[:, 1:3] .= m.conv_state[:, 2:4]` allocates ~74KB
  # Manual loop is allocation-free
- if m.conv_kernel > 1
+if m.conv_kernel > 1
  for j in 1:(m.conv_kernel-1)
- @simd ivdep for i in 1:m.conv_channels
- @inbounds m.conv_state[i, j] = m.conv_state[i, j+1]
+  @turbo for i in 1:m.conv_channels
+   m.conv_state[i, j] = m.conv_state[i, j+1]
+  end
  end
- end
- end
- # Copy qkv to the last column of conv_state
- @simd ivdep for i in 1:m.conv_channels
- @inbounds m.conv_state[i, m.conv_kernel] = qkv[i]
- end
+end
+# Copy qkv to the last column of conv_state
+@turbo for i in 1:m.conv_channels
+ m.conv_state[i, m.conv_kernel] = qkv[i]
+end
  
  # 3. Compute convolution with fused SiLU activation
  # x_conv[c] = silu(sum_k conv_state[c,k] * ssm_conv1d[c,k])
@@ -600,25 +600,21 @@ for h in 1:m.num_v_heads
  q_normalized = m.q_norm_buf
  k_normalized = m.k_norm_buf
  
- # Compute squared sums for L2 norm with SIMD
- q_sum_sq = 0.0f0
- k_sum_sq = 0.0f0
- @simd ivdep for i in 1:m.head_k_dim
- @inbounds begin
+# Compute squared sums for L2 norm with @turbo
+q_sum_sq = 0.0f0
+k_sum_sq = 0.0f0
+@turbo for i in 1:m.head_k_dim
  q_sum_sq += qg[i] * qg[i]
  k_sum_sq += kg[i] * kg[i]
- end
- end
- 
- # Fused normalize + scale in one pass with SIMD
- q_norm_val = 1.0f0 / (sqrt(q_sum_sq) + eps) * scale
- k_norm_val = 1.0f0 / (sqrt(k_sum_sq) + eps)
- @simd ivdep for i in 1:m.head_k_dim
- @inbounds begin
+end
+
+# Fused normalize + scale in one pass with @turbo
+q_norm_val = 1.0f0 / (sqrt(q_sum_sq) + eps) * scale
+k_norm_val = 1.0f0 / (sqrt(k_sum_sq) + eps)
+@turbo for i in 1:m.head_k_dim
  q_normalized[i] = qg[i] * q_norm_val
  k_normalized[i] = kg[i] * k_norm_val
- end
- end
+end
 
  # Gate values
  alpha_val = clamp(Float64(alpha_proj[h]) + Float64(m.ssm_dt_bias[h]), -20.0, 20.0)
@@ -687,9 +683,9 @@ end
 
 # 9. SiLU gate on z
 # silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
-# Output: norm(y_all) * silu(z) - use SIMD for element-wise operation
-@simd ivdep for i in 1:length(y_all)
- @inbounds y_all[i] = y_all[i] * z[i] * (1.0f0 / (1.0f0 + exp(-z[i])))
+# Output: norm(y_all) * silu(z) - use @turbo for SIMD
+@turbo for i in 1:length(y_all)
+ y_all[i] = y_all[i] * z[i] * (1.0f0 / (1.0f0 + exp(-z[i])))
 end
 # Removed variance scaling as it caused looping/instability
 # y_all .*= 1.0f0 / sqrt(Float32(m.head_v_dim))
@@ -951,10 +947,10 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for t in 1:seq_len
  tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
- # Copy embedding to pre-allocated buffer
- @simd for i in 1:length(model.embed_buf)
- @inbounds model.embed_buf[i] = model.embed[i, tok]
- end
+# Copy embedding to pre-allocated buffer
+@turbo for i in 1:length(model.embed_buf)
+ model.embed_buf[i] = model.embed[i, tok]
+end
  x = model.embed_buf
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])
@@ -971,10 +967,10 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for t in 1:seq_len
  tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
- # Copy embedding to pre-allocated buffer (avoids slice allocation)
- @simd for i in 1:length(model.embed_buf)
- @inbounds model.embed_buf[i] = model.embed[i, tok]
- end
+# Copy embedding to pre-allocated buffer (avoids slice allocation)
+@turbo for i in 1:length(model.embed_buf)
+ model.embed_buf[i] = model.embed[i, tok]
+end
  x = model.embed_buf
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])

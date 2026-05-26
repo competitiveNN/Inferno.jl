@@ -164,7 +164,7 @@ function read_gguf(path::AbstractString)
     return GGUFFile(metadata, tensors, data_offset, mapped_data)
 end
 
-export get_tensor
+export get_tensor, get_tensor_raw_bytes
 function get_tensor(file::GGUFFile, name::String)
     if !haskey(file.tensors, name)
         error("Tensor not found: $name")
@@ -173,10 +173,37 @@ function get_tensor(file::GGUFFile, name::String)
     info = file.tensors[name]
     start_idx = file.data_offset + info.offset + 1
 
-    # Calculate bytes based on type and dimensions
+    # Calculate bytes based on type and dimensions, returning raw bytes
     # For simplicity, assuming f32 or f16 for now to get length, complex types need block sizing
     # It would be better to return a pointer or a view of the bytes
     return info
+end
+
+"""
+    get_tensor_raw_bytes(file::GGUFFile, name::String)
+
+Get raw tensor data bytes from the mapped memory.
+This is useful for dequantization or direct GPU upload.
+"""
+function get_tensor_raw_bytes(file::GGUFFile, name::String)
+    if !haskey(file.tensors, name)
+        error("Tensor not found: $name")
+    end
+
+    info = file.tensors[name]
+    start_offset = file.data_offset + info.offset
+    
+    # Calculate size in bytes based on type and dimensions
+    # For Q4_K types, this is complex (5 bytes per 32 values). Simplifying for now.
+    # We return a view of the raw bytes.
+    total_elements = prod(info.dimensions)
+    
+    # Approximate: assume 4 bytes per element (worst case F32)
+    # For quantized types, we'd need to use dequantization logic
+    bytes_per_element = 4  # Upper bound
+    raw_bytes = @view file.tensor_data[start_offset + 1 : start_offset + total_elements * bytes_per_element]
+    
+    return raw_bytes
 end
 
 end # module

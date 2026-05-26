@@ -11,6 +11,7 @@ using ..QuantizedKernels
 using ..Tokenizer
 using ..Safetensors: load_safetensors_model
 using ..ArrowLake
+using ..Jamba
 using BFloat16s
 
 export load_model_cpu, detect_model_format, extract_tensor_cpu
@@ -252,9 +253,27 @@ function load_model_cpu(path::String; keep_quantized::Union{Bool,Nothing}=nothin
  # Detect format
  fmt = detect_model_format(path)
  
- if fmt == :safetensors
- # Load from safetensors
- return load_safetensors_model(path)
+# Pre-load Qwen3 module for architecture detection
+ 
+if fmt == :safetensors
+# Check architecture for safetensors models before loading
+try
+config_json = joinpath(path, "config.json")
+if isfile(config_json)
+config_text = read(config_json, String)
+if occursin("\"qwen3\"", config_text) || occursin("\"Qwen3ForCausalLM\"", config_text)
+@info "Detected Qwen3 architecture - routing to Qwen3 loader"
+return Qwen3.load_qwen3_safetensors(path; keep_quantized=keep_quantized, use_bf16_weights=use_bf16_weights)
+elseif occursin("\"jamba\"", config_text) || occursin("\"JambaForCausalLM\"", config_text)
+@info "Detected Jamba architecture - routing to Jamba loader"
+return Jamba.load_jamba_safetensors(path; keep_quantized=keep_quantized, use_bf16_weights=use_bf16_weights)
+end
+end
+catch e
+@warn "Error checking safetensors architecture" exception=(e, catch_backtrace())
+end
+# Fall through to existing safetensors loader
+return load_safetensors_model(path)
  elseif fmt == :gguf
  # If path is a directory, find the GGUF file
  original_path = path
@@ -264,6 +283,18 @@ function load_model_cpu(path::String; keep_quantized::Union{Bool,Nothing}=nothin
  if isempty(gguf_files)
  error("No GGUF files found in directory: $path")
  end
+# First check if this is a Qwen3 GGUF by loading metadata only
+# Load GGUF header to check architecture
+file = GGUF.read_gguf(path)
+arch = get(file.metadata, "general.architecture", "qwen")
+if arch == "qwen3"
+@info "Detected Qwen3 GGUF architecture - routing to Qwen3 loader"
+return Qwen3.load_qwen3_cpu(path; keep_quantized=keep_quantized, use_bf16_weights=use_bf16_weights)
+elseif arch == "jamba"
+@info "Detected Jamba GGUF architecture - routing to Jamba loader"
+return Jamba.load_jamba_cpu(path; keep_quantized=keep_quantized, use_bf16_weights=use_bf16_weights)
+end
+# Not Qwen3/Jamba, continue with normal loading - path is still directory
  # Prefer F32 or F16 over quantized versions
  preferred = ["F32.gguf", "F16.gguf", "BF16.gguf"]
  selected_file = nothing

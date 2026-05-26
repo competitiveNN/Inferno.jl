@@ -1,21 +1,6 @@
 """
 Safetensors loader for Inferno.jl
-
 Loads model weights from HuggingFace safetensors format.
-Safetensors is a safe tensor serialization format that prevents arbitrary code execution
-and provides memory-mapped lazy loading.
-
-# Exports
-- `load_safetensors_model`: Load a complete model from safetensors
-- `SafetensorsFile`: The parsed safetensors file struct
-- `parse_safetensors`: Parse a safetensors file header
-- `get_tensor`: Extract a specific tensor
-- `list_tensors`: List tensors matching a pattern
-
-# Example
-```julia
-model, tok = load_safetensors_model("path/to/model_dir")
-```
 """
 module Safetensors
 
@@ -27,44 +12,14 @@ using ..Tokenizer
 export load_safetensors_model, SafetensorsFile
 
 struct SafetensorsFile
- """
- SafetensorsFile struct containing parsed safetensors data.
- 
- # Fields
- - `path::String`: Path to the file
- - `metadata::Dict{String,Any}`: File metadata (if any)
- - `tensors::Dict{String,Tuple{Int,Int,Vector{Int}}}`: Tensor info (name -> (offset, dtype, shape))
- - `data::Vector{UInt8}`: Raw tensor data
- """
- path::String
- metadata::Dict{String, Any}
- tensors::Dict{String, Tuple{Int, Int, Vector{Int}}} # name -> (offset, dtype, shape)
- data::Vector{UInt8}
+    path::String
+    metadata::Dict{String, Any}
+    tensors::Dict{String, Tuple{Int, Int, Vector{Int}}}  # name -> (offset, dtype, shape)
+    data::Vector{UInt8}
 end
 
 """
- parse_safetensors(path::String) -> SafetensorsFile
-
-Parse a safetensors file header and return tensor metadata.
-
-Safetensors files have a binary format:
-1. First 8 bytes: header size (little-endian uint64)
-2. Header: JSON object with tensor metadata (names, shapes, offsets)
-3. Data: Raw tensor data following the header
-
-This function parses the header and prepares the file for lazy tensor loading.
-
-# Arguments
-- `path::String`: Path to the .safetensors file
-
-# Returns
-`SafetensorsFile` containing parsed metadata and raw data buffer
-
-# Example
-```julia
-sf = parse_safetensors("model.safetensors")
-embed = get_tensor(sf, "model.language_model.embed_tokens.weight")
-```
+Parse safetensors file header and return tensor info.
 """
 function parse_safetensors(path::String)
     data = read(path)
@@ -105,42 +60,22 @@ function parse_safetensors(path::String)
         tensors[name] = (data_offset + offsets[1] + 1, dtype, shape)
     end
     
-    metadata_raw = get(header, "__metadata__", nothing)
- metadata = if metadata_raw === nothing
-     Dict{String, Any}()
- else
-     Dict{String, Any}(String(k) => v for (k, v) in pairs(metadata_raw))
- end
+    metadata_raw = get(header, "__metadata__", Dict{String, Any}())
+    # Convert JSON3.Object to Dict{String, Any} if needed, ensuring all keys are Strings
+    metadata = Dict{String, Any}()
+    if typeof(metadata_raw) <: JSON3.Object
+        for (key, value) in pairs(metadata_raw)
+            metadata[String(key)] = value
+        end
+    else
+        metadata = metadata_raw
+    end
     
     return SafetensorsFile(path, metadata, tensors, data)
 end
 
 """
- get_tensor(sf::SafetensorsFile, name::String) -> Union{Matrix, Nothing}
-
-Get tensor data from a parsed safetensors file.
-
-Converts row-major (safetensors) to column-major (Julia) automatically.
-Handles Float32, Float16, and BFloat16 data types.
-
-# Arguments
-- `sf::SafetensorsFile`: The parsed safetensors file
-- `name::String`: Tensor name/key
-
-# Returns
-- `Matrix{Float32}` if tensor exists and is loaded successfully
-- `nothing` if tensor does not exist
-
-# Supported Data Types
-- F32 (dtype=1): Direct Float32 extraction
-- F16 (dtype=2): Converted to Float32
-- BF16 (dtype=3): Converted to Float32 via bit manipulation
-
-# Example
-```julia
-sf = parse_safetensors("model.safetensors")
-embedding = get_tensor(sf, "model.language_model.embed_tokens.weight")
-```
+Get tensor data from safetensors file.
 """
 function get_tensor(safetensors::SafetensorsFile, name::String)
  if !haskey(safetensors.tensors, name)
@@ -207,16 +142,7 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
 end
 
 """
- list_tensors(safetensors::SafetensorsFile, pattern::Regex) -> Vector{String}
-
-List all tensor names matching a regex pattern.
-
-# Example
-```julia
-sf = parse_safetensors("model.safetensors")
-# Find all attention weights
-attention_weights = list_tensors(sf, r"attention.*weight")
-```
+List all tensor names matching a pattern.
 """
 function list_tensors(safetensors::SafetensorsFile, pattern::Regex)
     return filter(name -> occursin(pattern, name), keys(safetensors.tensors))
@@ -255,14 +181,7 @@ function load_safetensors_model(model_path::String)
  end
  config = JSON3.read(read(config_path, String))
     
-    # Auto-detect Gemma4 models and route to parent module's loader
-    config_text = read(config_path, String)
-    if occursin("\"gemma4\"", config_text) || occursin("\"model_type\": \"gemma4\"", config_text)
-        @info "Detected Gemma4 model architecture, routing to Gemma4 loader"
-        return Main.Inferno.Gemma4Loader.load_gemma4(model_dir)
-    end
-    
-    # Parse text_config and continue with Qwen loading
+    # Parse text_config
     text_config = get(config, "text_config", Dict{String, Any}())
     
     # Create QwenConfigCPU
@@ -300,14 +219,26 @@ function load_safetensors_model(model_path::String)
         println("  $name")
     end
     
- # Load embedding
- embed = get_tensor(sf, "model.language_model.embed_tokens.weight")
- if embed === nothing
- error("Could not find embed_tokens.weight")
- end
- # get_tensor already returns correctly shaped matrix (vocab_size, hidden_size)
- # We need (hidden_size, vocab_size) for our model, so transpose
- embed = Matrix(Float32.(embed'))
+    # Load embedding - try to find the embedding tensor by name
+    embed_tensor_name = nothing
+    for name in keys(sf.tensors)
+        if endswith(name, "embed_tokens.weight") || endswith(name, ".embed.weight") || endswith(name, "wt_embedding")
+            embed_tensor_name = name
+            break
+        end
+    end
+    if embed_tensor_name === nothing
+        # Print available tensors for debugging
+        println("Available tensors:")
+        for name in keys(sf.tensors)
+            println("  $name")
+        end
+        error("Could not find embed_tokens.weight")
+    end
+    embed = get_tensor(sf, embed_tensor_name)
+    # get_tensor already returns correctly shaped matrix (vocab_size, hidden_size)
+    # We need (hidden_size, vocab_size) for our model, so transpose
+    embed = Matrix(Float32.(embed'))
  
  println("\\nEmbedding shape: ", size(embed))
     
@@ -366,10 +297,8 @@ post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w) .+ 1.0f0), model_confi
             mlp = load_mlp_safetensors(sf, layer_idx, model_config)
         end
         
- push!(layers, ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm,
- Vector{Float32}(undef, model_config.hidden_size), # norm_buf1
- Vector{Float32}(undef, model_config.hidden_size))) # norm_buf2
- end
+        push!(layers, ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm))
+    end
     
     # Load final norm
     final_norm_w = nothing
@@ -384,80 +313,20 @@ if final_norm_w === nothing
 end
 # ModelCPU expects +1 (layernorm1p convention) - add 1 to match GGUF format
 final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
- 
- println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
- 
- # LM head (tied with embedding for Qwen)
- lm_head = Matrix{Float32}(embed')
- 
- # Create RoPE
- rotary_dim = round(Int, model_config.head_dim * model_config.partial_rotary_factor)
- rope = ModelCPU.RotaryEmbeddingCPU(model_config.head_dim, model_config.rope_theta, model_config.max_position_embeddings; rotary_dim=rotary_dim)
- 
- # Load MTP head if present
- mtp_head = load_mtp_head(sf, model_config, rope)
- if mtp_head !== nothing
- println("\nMTP head loaded successfully!")
- end
- 
- # Load tokenizer
- tokenizer = load_hf_tokenizer(model_dir)
- 
- # Pre-allocate buffers
- embed_buf = Vector{Float32}(undef, model_config.hidden_size)
- final_norm_buf = Vector{Float32}(undef, model_config.hidden_size)
- lm_head_buf = Vector{Float32}(undef, model_config.vocab_size)
- 
- return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope, embed_buf, final_norm_buf, lm_head_buf, mtp_head), tokenizer
-end
-
-"""Load MTP (Multi-Token Prediction) head from safetensors if present."""
-function load_mtp_head(sf, config::ModelCPU.QwenConfigCPU, rope::ModelCPU.RotaryEmbeddingCPU)
- # Check if MTP weights exist
- mtp_tensors = [k for k in keys(sf.tensors) if startswith(k, "mtp.")]
- 
- if isempty(mtp_tensors)
- println("\nNo MTP weights found in model")
- return nothing
- end
- 
- println("\nLoading MTP head...")
- println(" MTP tensors found: ", length(mtp_tensors))
- 
- # Load pre-fc norms
- pre_fc_norm_emb_w = get_tensor(sf, "mtp.pre_fc_norm_embedding.weight")
- pre_fc_norm_hidden_w = get_tensor(sf, "mtp.pre_fc_norm_hidden.weight")
- 
- # MTP norms don't use +1 (layernorm1p convention is for main model only)
- pre_fc_norm_embedding = ModelCPU.RMSNormCPU(vec(Float32.(pre_fc_norm_emb_w)), config.rms_norm_eps)
- pre_fc_norm_hidden = ModelCPU.RMSNormCPU(vec(Float32.(pre_fc_norm_hidden_w)), config.rms_norm_eps)
- 
- # Load fc projection: (vocab_size, 2*hidden) or (vocab_size, hidden)
- fc_w = get_tensor(sf, "mtp.fc.weight")
- fc = Float32.(fc_w)
- 
- # Load final norm
- norm_w = get_tensor(sf, "mtp.norm.weight")
- norm = ModelCPU.RMSNormCPU(vec(Float32.(norm_w)), config.rms_norm_eps)
- 
- # Load MTP layer if present (mtp.layers.0.*)
- mtp_layers = ModelCPU.DecoderLayerCPU[]
- # Note: MTP attention layer requires matching FullAttentionCPU structure
- # For now, we skip it since the main MTP functionality is in the fc projection
- # The attention layer is optional and provides additional context refinement
- 
- # Pre-allocate buffers for MTP
- embed_buf = Vector{Float32}(undef, config.hidden_size)
- hidden_buf = Vector{Float32}(undef, config.hidden_size)
- combined_buf = Vector{Float32}(undef, 2 * config.hidden_size)
- fc_out_buf = Vector{Float32}(undef, config.hidden_size) # fc output buffer
- logits_buf = Vector{Float32}(undef, config.vocab_size) # final vocab logits
- 
- return ModelCPU.MTPHeadCPU(
- pre_fc_norm_embedding, pre_fc_norm_hidden,
- fc, mtp_layers, norm,
- embed_buf, hidden_buf, combined_buf, fc_out_buf, logits_buf
- )
+    
+    println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
+    
+    # LM head (tied with embedding for Qwen)
+    lm_head = embed'
+    
+    # Create RoPE
+    rotary_dim = round(Int, model_config.head_dim * model_config.partial_rotary_factor)
+    rope = ModelCPU.RotaryEmbeddingCPU(model_config.head_dim, model_config.rope_theta, model_config.max_position_embeddings; rotary_dim=rotary_dim)
+    
+    # Load tokenizer
+    tokenizer = load_hf_tokenizer(model_dir)
+    
+    return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope), tokenizer
 end
 
 """
@@ -614,15 +483,15 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
             tensor = get_tensor(sf, name)
             gate_proj = Matrix{Float32}(tensor)  # (2048, 1024) - no transpose needed
  elseif occursin("linear_attn.in_proj_a", name)
-  tensor = get_tensor(sf, name)
-  # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
-  # Forward pass does: mul!(buf, weight, x) where weight * x
-  # Need (num_v_heads, hidden_size) = (16, 1024) so (16,1024) * (1024,) = (16,)
-  alpha_weight = Matrix{Float32}(tensor) # Already (16, 1024), no transpose needed
+ tensor = get_tensor(sf, name)
+ # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
+ # ModelCPU expects (hidden_size, num_v_heads) = (1024, 16) for: weight' * x
+ # Need to transpose
+ alpha_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
  elseif occursin("linear_attn.in_proj_b", name)
-  tensor = get_tensor(sf, name)
-  # Same as alpha - keep as (num_v_heads, hidden_size) = (16, 1024)
-  beta_weight = Matrix{Float32}(tensor) # Already (16, 1024), no transpose needed
+ tensor = get_tensor(sf, name)
+ # Same as alpha - transpose to match ModelCPU expectation
+ beta_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
         elseif occursin("linear_attn.out_proj", name)
             tensor = get_tensor(sf, name)
             ssm_out = Matrix{Float32}(tensor)  # (1024, 2048) - no transpose needed
@@ -771,13 +640,13 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  end
  end
  
-# Default norms
-if q_norm_w === nothing
- q_norm_w = ones(Float32, config.head_dim) .+ 1.0f0
-end
-if k_norm_w === nothing
- k_norm_w = ones(Float32, config.head_dim) .+ 1.0f0
-end
+ # Default norms
+ if q_norm_w === nothing
+ q_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
+ end
+ if k_norm_w === nothing
+ k_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
+ end
  
  q_norm = ModelCPU.RMSNormCPU(q_norm_w, config.rms_norm_eps)
  k_norm = ModelCPU.RMSNormCPU(k_norm_w, config.rms_norm_eps)
@@ -805,12 +674,6 @@ end
  max_seq = config.max_position_embeddings
  scores_buf = Vector{Float32}(undef, max_seq)
  
- # Flash attention output buffer (head_dim per head)
- fa_output_buf = Vector{Float32}(undef, head_dim)
- 
- # Default: flash attention enabled
- use_fa = get(ENV, "INFERNO_USE_FLASH_ATTENTION", "true") != "false"
- 
  return ModelCPU.FullAttentionCPU(
  layer_idx,
  wq, wk, wv, wo,
@@ -818,8 +681,7 @@ end
  n_heads, n_kv, head_dim,
  Float32(1.0 / sqrt(head_dim)),
  qkv_buf, k_buf, v_buf,
- query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf,
- fa_output_buf, use_fa
+ query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf
  )
 end
 

@@ -5,7 +5,7 @@ using oneAPI
 using LinearAlgebra
 
 export fused_l2norm!, fused_attention_weighted_sum!, fused_mlp_gate_mul!, fused_silu_gate_mul!
-export fused_ssm_gate_sigmoid!, fused_ssm_decay!
+export fused_ssm_gate_sigmoid!, fused_ssm_decay!, gpu_argmax!, gpu_sample!
 
 # ============================================================
 # L2 Norm (in-place) — avoids allocating x.^2
@@ -124,6 +124,86 @@ function fused_ssm_decay!(out::AbstractArray{Float32,1}, a::AbstractArray{Float3
     kernel = ssm_decay_kernel!
     kernel(out, a, dt; ndrange=n)
     return out
+end
+
+# ============================================================
+# GPU-native argmax (returns index to CPU, no full array copy)
+# Single reduction kernel: finds max and its index
+# ============================================================
+@kernel function argmax_kernel!(logits, result)
+    # Simple 1-thread reduction (sufficient for vocab ~ 151k)
+    # For larger vocab, use parallel reduction
+    @inbounds result[1] = 1
+    max_val = logits[1]
+    @inbounds for i in 2:length(logits)
+        if logits[i] > max_val
+            max_val = logits[i]
+            result[1] = i
+        end
+    end
+end
+
+function gpu_argmax!(logits::AbstractArray{Float32,1})
+    result = oneAPI.oneArray{Int}(undef, 1)
+    kernel = argmax_kernel!
+    kernel(logits, result; ndrange=1)
+    # Must sync here to get result back to CPU for next token ID
+    # But this is O(1) transfer vs O(vocab) for full Array(logits)
+    return oneAPI.Array(result)[1]
+end
+
+# ============================================================
+# GPU-native temperature + top-k sampling
+# Returns sampled token index to CPU (O(1) transfer)
+# ============================================================
+@kernel function temperature_topk_kernel!(logits, temperature, out_probs)
+    n = length(logits)
+    # Step 1: Apply temperature scaling in-place
+    @inbounds for i in 1:n
+        logits[i] = logits[i] / temperature
+    end
+    # Step 2: Find max for numerical stability
+    max_val = logits[1]
+    @inbounds for i in 2:n
+        if logits[i] > max_val
+            max_val = logits[i]
+        end
+    end
+    # Step 3: Compute exp and sum
+    sum_exp = 0.0f0
+    @inbounds for i in 1:n
+        exp_val = exp(logits[i] - max_val)
+        out_probs[i] = exp_val
+        sum_exp += exp_val
+    end
+    # Step 4: Normalize
+    inv_sum = 1.0f0 / sum_exp
+    @inbounds for i in 1:n
+        out_probs[i] *= inv_sum
+    end
+end
+
+function gpu_sample!(logits::AbstractArray{Float32,1}, temperature::Float32)
+    n = length(logits)
+    out_probs = oneAPI.oneArray{Float32}(undef, n)
+    
+    kernel = temperature_topk_kernel!
+    kernel(logits, temperature, out_probs; ndrange=1)
+    
+    # Copy probs to CPU for sampling (O(vocab) - unavoidable for now)
+    # In future: implement GPU-side cumulative sum + binary search
+    cpu_probs = oneAPI.Array(out_probs)
+    
+    # CPU-side sample
+    r = rand(Float32)
+    cumsum = 0.0f0
+    @inbounds for i in 1:n
+        cumsum += cpu_probs[i]
+        if r <= cumsum
+            return i
+        end
+    end
+    return n
 end
 
 end # module

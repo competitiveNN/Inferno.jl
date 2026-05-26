@@ -132,6 +132,24 @@ end
         y = dequantize_iq3_xxs(data, 256)
         @test all(y .== Float16(0.0))
     end
+
+    @testset "IQ2_S" begin
+        data = zeros(UInt8, 82); data[1] = 0x00; data[2] = 0x3c
+        y = dequantize_iq2_s(data, 256)
+        @test all(y .== Float16(0.0))
+    end
+
+    @testset "IQ3_S" begin
+        data = zeros(UInt8, 110); data[1] = 0x00; data[2] = 0x3c
+        y = dequantize_iq3_s(data, 256)
+        @test all(y .== Float16(0.0))
+    end
+
+    @testset "IQ4_XS" begin
+        data = zeros(UInt8, 136); data[1] = 0x00; data[2] = 0x00
+        y = dequantize_iq4_xs(data, 256)
+        @test all(y .== Float16(0.0))
+    end
 end
 
 

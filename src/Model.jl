@@ -2,8 +2,12 @@ module Model
 
 using LinearAlgebra
 using Statistics
-using oneAPI
-using oneAPI.oneMKL
+# GPU backend (optional)
+try
+    using oneAPI
+    using oneAPI.oneMKL
+catch
+end
 
 export QwenConfig, QwenModel, KVCache, forward!, RMSNorm, MLP, MoE, GatedDeltaNet, FullAttention, MLAttention, DecoderLayer, init_kv_cache, free_kv_cache!, free_all_kv_caches!, free_model_gpu!
 

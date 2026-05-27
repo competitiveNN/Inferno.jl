@@ -6,7 +6,7 @@ using Printf, Statistics
 
 const MODEL_PATH = get(ENV, "INFERNO_MODEL", "models/Qwen3.5-0.8B-v3_q4_k_m.gguf")
 const WARMUP = 8
-const BENCH_TOKENS = 256
+const BENCH_TOKENS=128 
 const PROMPT = "The quick brown fox"
 
 function run_benchmark()

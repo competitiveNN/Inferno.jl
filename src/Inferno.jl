@@ -3,10 +3,9 @@ module Inferno
 using Printf
 
 # GPU backend (optional)
-try
-    using oneAPI
-catch
-end
+include("GPUInit.jl")
+# GPUInit.__init__() is called in __init__() to ensure it runs in the live session
+# and not during precompilation, where the _initialized state would be cached.
 
 include("QuantsData.jl")
 include("Dequant.jl")
@@ -541,6 +540,10 @@ include("Chat.jl")
 using .Chat
 
 function __init__()
+    # Initialize Level Zero in the live session
+    # (not during precompilation, to avoid stale _initialized state)
+    GPUInit.__init__()
+    
     # Register atexit hook to ensure GPU synchronization and cleanup
     # This helps prevent device lockups on unclean shutdowns
     # However, if oneAPI is not initialized, this will fail

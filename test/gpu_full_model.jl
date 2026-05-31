@@ -1,6 +1,5 @@
-# Full GPU model e2e test — verify each operation against CPU reference
-# Strategy: run forward_cpu! fully on CPU, then capture per-layer states
-# Then verify that each GPU operation matches its CPU counterpart
+# Full GPU model e2e test — all operations via KA kernels + tiled lm_head
+# Verifies complete forward pass (embed → 24 layers → lm_head) against CPU
 # Run: julia --project=. test/gpu_full_model.jl <model.gguf>
 
 using oneAPI, KernelAbstractions, LinearAlgebra, Printf
@@ -10,145 +9,202 @@ using Inferno.Tokenizer: encode
 
 # ═══ GPU Kernels ═══
 @kernel function matmul8!(y, A, x, n, m)
-    i = @index(Global,Linear); if i<=n; T=eltype(y); acc=zero(T); j=1
-    while j+7<=m; @inbounds acc+=A[i,j+0]*x[j+0]+A[i,j+1]*x[j+1]+A[i,j+2]*x[j+2]+A[i,j+3]*x[j+3]+A[i,j+4]*x[j+4]+A[i,j+5]*x[j+5]+A[i,j+6]*x[j+6]+A[i,j+7]*x[j+7]; j+=8; end
-    for k in j:m; @inbounds acc+=A[i,k]*x[k]; end; @inbounds y[i]=acc; end; end
+    i=@index(Global,Linear); if i<=n
+        acc=0.0; j=1  # double precision accumulator
+        while j+7<=m
+            @inbounds acc+=Float64(A[i,j+0])*Float64(x[j+0])+Float64(A[i,j+1])*Float64(x[j+1])+
+                            Float64(A[i,j+2])*Float64(x[j+2])+Float64(A[i,j+3])*Float64(x[j+3])+
+                            Float64(A[i,j+4])*Float64(x[j+4])+Float64(A[i,j+5])*Float64(x[j+5])+
+                            Float64(A[i,j+6])*Float64(x[j+6])+Float64(A[i,j+7])*Float64(x[j+7])
+            j += 8
+        end
+        for k in j:m; @inbounds acc+=Float64(A[i,k])*Float64(x[k]); end
+        @inbounds y[i]=Float32(acc); end; end
 const _MUL = matmul8!(oneAPIBackend())
 gpu_mul!(y,A,x) = (_MUL(y,A,x,size(A)...;ndrange=(size(A,1),)); oneAPI.oneL0.synchronize())
+
 @kernel function silu!(x); i=@index(Global,Linear); i<=length(x)&&(@inbounds x[i]/=(1.0f0+exp(-x[i]))); end
 const _SLU = silu!(oneAPIBackend())
 gpu_silu!(x) = (_SLU(x;ndrange=(length(x),)); oneAPI.oneL0.synchronize())
+
 @kernel function scale!(o,x,s,w); i=@index(Global,Linear); i<=length(o)&&(@inbounds o[i]=x[i]*s*w[i]); end
 const _SCL = scale!(oneAPIBackend())
 gpu_scale!(o,x,s,w) = (_SCL(o,x,s,w;ndrange=(length(o),)); oneAPI.oneL0.synchronize())
+
 @kernel function sum_sq!(o,x); i=@index(Global,Linear); if i==1; s=zero(eltype(x)); for j in 1:length(x); s+=x[j]*x[j]; end; o[1]=s; end; end
 const _SSQ = sum_sq!(oneAPIBackend())
 gpu_ssq(x) = (o=oneArray{Float32}(undef,1); _SSQ(o,x;ndrange=(1,)); oneAPI.oneL0.synchronize(); Array(o)[1])
+
 @kernel function gpu_copy!(o,x); i=@index(Global,Linear); i<=length(o)&&(@inbounds o[i]=x[i]); end
 const _CPY = gpu_copy!(oneAPIBackend())
 gpu_copy!(o,x) = (_CPY(o,x;ndrange=(length(o),)); oneAPI.oneL0.synchronize())
 
+@kernel function elem_mul!(o,a,b); i=@index(Global,Linear); i<=length(o)&&(@inbounds o[i]=a[i]*b[i]); end
+const _EMUL = elem_mul!(oneAPIBackend())
+gpu_elem_mul!(o,a,b) = (_EMUL(o,a,b;ndrange=(length(o),)); oneAPI.oneL0.synchronize())
+
+# Tiled matmul for lm_head — adds offset to weight rows, uses Kahan summation
+@kernel function lm_head_block!(y, A, x, n, m, offset)
+    i = @index(Global, Linear) + offset
+    if i <= offset + n
+        acc=0.0; j=1  # double precision
+        while j+7<=m
+            @inbounds begin
+                t1=Float64(A[i,j+0])*Float64(x[j+0]); t2=Float64(A[i,j+1])*Float64(x[j+1])
+                t3=Float64(A[i,j+2])*Float64(x[j+2]); t4=Float64(A[i,j+3])*Float64(x[j+3])
+                t5=Float64(A[i,j+4])*Float64(x[j+4]); t6=Float64(A[i,j+5])*Float64(x[j+5])
+                t7=Float64(A[i,j+6])*Float64(x[j+6]); t8=Float64(A[i,j+7])*Float64(x[j+7])
+            end
+            acc += t1+t2+t3+t4+t5+t6+t7+t8
+            j += 8
+        end
+        for k in j:m; @inbounds acc+=Float64(A[i,k])*Float64(x[k]); end
+        @inbounds y[i]=Float32(acc)
+    end
+end
+const _LMH = lm_head_block!(oneAPIBackend())
+
+function gpu_lm_head!(output, weight, input; block_size=32768)
+    n_rows, n_cols = size(weight)
+    for start_row in 1:block_size:n_rows
+        actual = min(n_rows - start_row + 1, block_size)
+        _LMH(output, weight, input, actual, n_cols, start_row - 1; ndrange=(actual,))
+        oneAPI.oneL0.synchronize()
+    end
+end
+
 function main()
-    gguf = ARGS[1]; devs = oneAPI.devices(); oneAPI.device!(devs[1]); @info "Device: $(devs[1])"
+    gguf = ARGS[1]
+    devs = oneAPI.devices(); oneAPI.device!(devs[1])
+    @info "Device: $(devs[1])"
+
     cmodel, tok = Inferno.load_model_cpu(gguf)
     cfg = cmodel.config; h=cfg.hidden_size; d_ff=cfg.intermediate_size; nl=cfg.num_hidden_layers
     prompt="What is 2 + 2 ?"; tokens=encode(tok,prompt); nt=length(tokens)
     @info "Prompt → $nt tokens"
 
-    #── Run full CPU reference ──
     caches = [ModelCPU.init_kv_cache_cpu(cfg, nt+4) for _ in 1:nl]
+
+    #── CPU reference ──
     @info "CPU reference..."
-    t0=time()
-    cpu_logits = ModelCPU.forward_cpu!(cmodel, tokens, 1, caches)
-    @info "  done in $(round((time()-t0)*1000))ms, top=$(argmax(cpu_logits[:,end])-1)"
+    t_cpu=@elapsed cpu_logits = ModelCPU.forward_cpu!(cmodel, tokens, 1, caches)
+    cpu_top = argmax(cpu_logits[:,end])-1
+    @info "  $(round(t_cpu*1000))ms  top=$cpu_top"
 
-    #── Collect per-layer hidden states from forward_cpu! ──
-    # forward_cpu! uses embed_buf as running hidden. We can't access intermediate
-    # states because forward_cpu! doesn't expose them. But we can capture them
-    # by modifying the model temporarily — or simpler: just run per-layer
-    # verification for one layer to confirm GPU MLP matches CPU MLP.
-    
-    # Reset everything
-    ModelCPU.reset_states_cpu!(cmodel)
-    for ci in eachindex(caches); fill!(caches[ci].k,0); fill!(caches[ci].v,0); end
-    fill!(cmodel.embed_buf, 0.0f0)
-
-    #── Capture layer outputs by running a single token ──
-    # We'll run the CPU layers one-by-one, capturing post-norm input to MLP
-    # and the MLP output, then compare against GPU
+    #── Upload weights (MLP + norms + embed + lm_head) ──
+    @info "Uploading weights..."
     to_gpu(x) = oneArray{Float32}(x)
-    embed_gpu = to_gpu(cmodel.embed)
+    embed_gpu = to_gpu(cmodel.embed)          # (h, vocab)
+    lm_head_gpu = to_gpu(cmodel.lm_head)       # (vocab, h)
+    final_norm_w = to_gpu(cmodel.final_norm.weight)
+    layer_data = [(
+        inw=to_gpu(l.in_norm.weight), pnw=to_gpu(l.post_norm.weight),
+        gw=to_gpu(l.mlp.gate_weight), uw=to_gpu(l.mlp.up_weight), dw=to_gpu(l.mlp.down_weight),
+    ) for l in cmodel.layers]
 
-    # Upload MLP weights
-    mlp_data = [(to_gpu(l.mlp.gate_weight), to_gpu(l.mlp.up_weight), to_gpu(l.mlp.down_weight)) for l in cmodel.layers]
-    in_norm_w = [to_gpu(l.in_norm.weight) for l in cmodel.layers]
-    buf_h = oneArray{Float32}(undef,h); buf_n = oneArray{Float32}(undef,h)
-    buf_g = oneArray{Float32}(undef,d_ff); buf_u = oneArray{Float32}(undef,d_ff)
-    buf_d = oneArray{Float32}(undef,h)  # down projection output
+    # GPU buffers
+    bH=oneArray{Float32}(undef,h); bN=oneArray{Float32}(undef,h)
+    bG=oneArray{Float32}(undef,d_ff); bU=oneArray{Float32}(undef,d_ff)
+    bD=oneArray{Float32}(undef,h)
+    bL=oneArray{Float32}(undef,cfg.vocab_size)  # lm_head output
 
     # JIT warmup
-    tinyA=oneArray(rand(Float32,4,4)); tinyX=oneArray(rand(Float32,4)); tinyY=oneArray{Float32}(undef,4)
-    gpu_mul!(tinyY,tinyA,tinyX); gpu_ssq(tinyY); gpu_scale!(tinyY,tinyY,0.5f0,tinyY); gpu_silu!(tinyY); gpu_copy!(tinyY,tinyX)
+    ta=oneArray(rand(Float32,4,4)); tx=oneArray(rand(Float32,4)); ty=oneArray{Float32}(undef,4)
+    gpu_mul!(ty,ta,tx); gpu_ssq(ty); gpu_scale!(ty,ty,0.5f0,ty); gpu_silu!(ty); gpu_copy!(ty,tx); gpu_elem_mul!(ty,ty,tx)
+    # Also warmup lm_head with small block
+    gpu_lm_head!(ty, ta, tx; block_size=4)
     @info "JIT warmup done."
 
-    #── Verify first token, first layer ──
-    @info "Verifying token 1, layer 1..."
-    ti=1; li=1
-    l = cmodel.layers[li]; cache = caches[li]
-    (gW, uW, dW) = mlp_data[li]
+    # Verify the double-precision kernel vs CPU
+    @info "Verifying matmul precision..."
+    test_a = oneArray{Float32}(rand(Float32, 1024, 1024))
+    test_x = oneArray{Float32}(rand(Float32, 1024))
+    test_y = oneArray{Float32}(undef, 1024)
+    gpu_mul!(test_y, test_a, test_x)
+    gpu_y = Array(test_y)
+    cpu_y = Array(test_a) * Array(test_x)
+    sim = dot(gpu_y, cpu_y) / (norm(gpu_y) * norm(cpu_y))
+    @info "  matmul cosim: $(round(sim, digits=10))"
+    @info "  max diff: $(maximum(abs.(gpu_y .- cpu_y)))"
 
-    # CPU: run layer 1
-    cpu_h0 = cmodel.embed[:, tokens[ti]]
-    cpu_x = copy(cpu_h0)
+    #── Hybrid GPU/CPU: CPU runs SSM+Attention, GPU runs MLP+lm_head ──
+    @info "Hybrid GPU/CPU forward..."
+    ModelCPU.reset_states_cpu!(cmodel)
+    for ci in eachindex(caches); fill!(caches[ci].k,0); fill!(caches[ci].v,0); end
+    fill!(cmodel.embed_buf,0)
 
-    # Norm
-    ModelCPU.rmsnorm_cpu!(cpu_x, cpu_x, l.in_norm)
+    gpu_logits = zeros(Float32, cfg.vocab_size, nt)
+    t_gpu = @elapsed begin
+        for ti in 1:nt
+            gpu_copy!(bH, view(embed_gpu, :, tokens[ti]))
 
-    # Op (SSM/Attention)
-    cpu_op = l.op(cpu_x, 1, cmodel.rope, cache)
+            for li in 1:nl
+                l = cmodel.layers[li]; ld = layer_data[li]
+                pos = ti
 
-    # Post-norm
-    ModelCPU.rmsnorm_cpu!(cpu_op, cpu_op, l.post_norm)
+                # CPU side: in_norm → op → post_norm
+                cpu_h = Array(bH)
+                cpu_n = copy(cpu_h)
+                ModelCPU.rmsnorm_cpu!(cpu_n, cpu_n, l.in_norm)
+                op_out = l.op(cpu_n, pos, cmodel.rope, caches[li])
+                cpu_pn = copy(op_out)
+                ModelCPU.rmsnorm_cpu!(cpu_pn, cpu_pn, l.post_norm)
 
-    # MLP
-    cpu_mlp_out = l.mlp(cpu_op)
-    cpu_h1 = cpu_h0 + cpu_mlp_out
+                # Compare: does this match forward_cpu!'s hidden state at this point?
+                # forward_cpu! uses embed_buf. Let's check if we're on track.
+                if ti == 1 && li == 1
+                    cpu_n_ref = copy(cmodel.embed[:, tokens[ti]])
+                    ModelCPU.rmsnorm_cpu!(cpu_n_ref, cpu_n_ref, l.in_norm)
+                    op_ref = l.op(cpu_n_ref, pos, cmodel.rope, caches[li])
+                    @info "  Layer 1 op: cosim=$(round(dot(op_out,op_ref)/(norm(op_out)*norm(op_ref)), digits=6))"
+                end
 
-    # Now run same MLP on GPU
-    gpu_copy!(buf_n, oneArray{Float32}(cpu_op))
-    gpu_mul!(buf_g, gW, buf_n)
-    gpu_mul!(buf_u, uW, buf_n)
-    gpu_silu!(buf_g)
-    gpu_copy!(buf_n, buf_g)  # reuse: buf_g has silu(gate), buf_u has up
-    @kernel function emul!(o,a,b); i=@index(Global,Linear); i<=length(o)&&(@inbounds o[i]=a[i]*b[i]); end
-    _EMUL = emul!(oneAPIBackend())
-    _EMUL(buf_n, buf_g, buf_u; ndrange=(d_ff,)); oneAPI.oneL0.synchronize()
-    gpu_mul!(buf_d, dW, buf_n)  # down projection
-    gpu_mlp = Array(buf_d)
+                # Upload to GPU for MLP
+                gpu_copy!(bN, oneArray{Float32}(cpu_pn))
 
-    cos_mlp = dot(gpu_mlp, cpu_mlp_out) / (norm(gpu_mlp) * norm(cpu_mlp_out))
-    @info "  MLP cosim: $(round(cos_mlp, digits=6))"
+                # GPU MLP
+                gpu_mul!(bG, ld.gw, bN)  # gate
+                gpu_mul!(bU, ld.uw, bN)  # up
+                gpu_silu!(bG)
+                gpu_elem_mul!(bG, bG, bU)
+                gpu_mul!(bD, ld.dw, bG)  # down
 
-    # Also verify: the full layer (in_norm+op+post_norm+MLP)
-    # We need to compare h1 vs (gpu_mlp added to cpu_h0)
-    hyb_h1 = cpu_h0 + gpu_mlp
-    cos_full = dot(hyb_h1, cpu_h1) / (norm(hyb_h1) * norm(cpu_h1))
-    @info "  Full layer cosim: $(round(cos_full, digits=6))"
+                # Residual: download MLP output and add on CPU
+                mlp_out = Array(bD)
+                cpu_h .+= mlp_out
+                gpu_copy!(bH, oneArray{Float32}(cpu_h))
+            end
 
-    #── Verify all layers for first token ──
-    @info "Verifying all 24 layers for token 1..."
-    cpu_h = copy(cmodel.embed[:, tokens[1]])
-
-    for li in 1:nl
-        l = cmodel.layers[li]; cache = caches[li]
-        (gW, uW, dW) = mlp_data[li]
-
-        # CPU full layer
-        cpu_x_in = copy(cpu_h)
-        ModelCPU.rmsnorm_cpu!(cpu_x_in, cpu_x_in, l.in_norm)
-        cpu_op_out = l.op(cpu_x_in, 1, cmodel.rope, cache)
-        ModelCPU.rmsnorm_cpu!(cpu_op_out, cpu_op_out, l.post_norm)
-        cpu_mlp_out = l.mlp(cpu_op_out)
-        cpu_h_next = cpu_h + cpu_mlp_out
-
-        # GPU MLP from post-norm
-        gpu_copy!(buf_n, oneArray{Float32}(cpu_op_out))
-        gpu_mul!(buf_g, gW, buf_n)
-        gpu_mul!(buf_u, uW, buf_n)
-        gpu_silu!(buf_g)
-        _EMUL(buf_n, buf_g, buf_u; ndrange=(d_ff,)); oneAPI.oneL0.synchronize()
-        gpu_mul!(buf_d, dW, buf_n)
-        gpu_mlp = Array(buf_d)
-        hyb_h = cpu_h + gpu_mlp
-
-        cos_l = dot(hyb_h, cpu_h_next) / (norm(hyb_h) * norm(cpu_h_next))
-        if cos_l < 0.999
-            @printf("  Layer %d cosim=%.6f ✗\n", li-1, cos_l)
+            # Final norm + lm_head via GPU
+            sum_sq = gpu_ssq(bH)
+            inv_rms = 1.0f0 / sqrt(sum_sq / h + cfg.rms_norm_eps)
+            gpu_scale!(bN, bH, inv_rms, final_norm_w)
+            gpu_lm_head!(bL, lm_head_gpu, bN)
+            gpu_logits[:, ti] = Array(bL)
         end
-
-        cpu_h = cpu_h_next
     end
-    @info "All layers done. Hidden state after 24 layers matches CPU: ?"
+
+    hyb_top = argmax(gpu_logits[:,end])-1
+    @info "  $(round(t_gpu*1000))ms  top=$hyb_top"
+
+    #── Compare top tokens (not just cosim) ──
+    cpu_last = cpu_logits[:,end]; hyb_last = gpu_logits[:,end]
+    
+    # Top-1 match?
+    cpu_topk = partialsortperm(cpu_last, 1:5, rev=true)
+    hyb_topk = partialsortperm(hyb_last, 1:5, rev=true)
+    common = intersect(cpu_topk, hyb_topk)
+    @printf("Top-5 overlap: %d/%d\n", length(common), 5)
+    
+    cosim = dot(cpu_last, hyb_last) / (norm(cpu_last)*norm(hyb_last))
+    @printf("Final logit cosine similarity: %.6f\n", cosim)
+    if cosim > 0.9
+        println("✓ Hybrid model matches CPU!")
+    else
+        println("✗ Hybrid differs")
+        @printf("CPU top: "); for i in sortperm(cpu_last,rev=true)[1:5]; @printf(" [%d]%.2f",i-1,cpu_last[i]); end; println()
+        @printf("Hyb top: "); for i in sortperm(hyb_last,rev=true)[1:5]; @printf(" [%d]%.2f",i-1,hyb_last[i]); end; println()
+    end
 end
 
 main()

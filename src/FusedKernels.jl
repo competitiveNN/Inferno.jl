@@ -10,6 +10,7 @@ const _GPU_BACKEND = oneAPIBackend()
 
 export fused_l2norm!, fused_attention_weighted_sum!, fused_mlp_gate_mul!, fused_silu_gate_mul!
 export fused_ssm_gate_sigmoid!, fused_ssm_decay!, gpu_argmax!, gpu_sample!
+export reduce_sum_kernel!, reduce_sum!, reduce_sum_sq!, scale_kernel!, scale!, elementwise_mul_kernel!, elementwise_mul!
 
 # ============================================================
 # L2 Norm (in-place) — type-generic version.
@@ -23,11 +24,101 @@ end
 function fused_l2norm!(x::AbstractArray{T,1}, eps::AbstractFloat) where T <: AbstractFloat
     n = length(x)
     n == 0 && return x
-    ss = dot(x, x)
+    # Use our kernel instead of BLAS dot — computes sum-of-squares in one kernel
+    ss = reduce_sum_sq!(x)
     inv_norm = one(T) / sqrt(ss + eps)
     kfn = l2norm_scale_kernel!(_GPU_BACKEND)
     kfn(x, inv_norm; ndrange=(n,))
     return x
+end
+
+# ============================================================
+# Reduction Kernel (GPU-safe sum — no BLAS dependency)
+# ============================================================
+@kernel function reduce_sum_kernel!(out, x)
+    i = @index(Global, Linear)
+    if i == 1
+        s = zero(eltype(x))
+        for j in 1:length(x)
+            s += x[j]
+        end
+        out[1] = s
+    end
+end
+
+function reduce_sum!(x::AbstractArray{T,1}) where T
+    out = oneAPI.oneArray{T}(undef, 1)
+    kfn = reduce_sum_kernel!(_GPU_BACKEND)
+    kfn(out, x; ndrange=(1,))
+    oneAPI.oneL0.synchronize()
+    return Array(out)[1]
+end
+
+function reduce_sum!(x::AbstractArray{T}) where T
+    return reduce_sum!(vec(x))
+end
+
+# ============================================================
+# Reduction Kernel (sum of squares — avoids broken broadcast)
+# ============================================================
+@kernel function reduce_sum_sq_kernel!(out, x)
+    i = @index(Global, Linear)
+    if i == 1
+        s = zero(eltype(x))
+        for j in 1:length(x)
+            s += x[j] * x[j]
+        end
+        out[1] = s
+    end
+end
+
+function reduce_sum_sq!(x::AbstractArray{T,1}) where T
+    out = oneAPI.oneArray{T}(undef, 1)
+    kfn = reduce_sum_sq_kernel!(_GPU_BACKEND)
+    kfn(out, x; ndrange=(1,))
+    oneAPI.oneL0.synchronize()
+    return Array(out)[1]
+end
+
+function reduce_sum_sq!(x::AbstractArray{T}) where T
+    return reduce_sum_sq!(vec(x))
+end
+
+# ============================================================
+# Scale Kernel (x[i] = y[i] * s * w[i])
+# No broadcast — uses KA kernel
+# ============================================================
+@kernel function scale_kernel!(out, x, scale, weight)
+    i = @index(Global, Linear)
+    if i <= length(out)
+        @inbounds out[i] = x[i] * scale * weight[i]
+    end
+end
+
+function scale!(out, x, scale, weight)
+    n = length(out)
+    kfn = scale_kernel!(_GPU_BACKEND)
+    kfn(out, x, scale, weight; ndrange=(n,))
+    oneAPI.oneL0.synchronize()
+    return out
+end
+
+# ============================================================
+# Element-wise Multiply Kernel (out[i] = a[i] * b[i])
+# ============================================================
+@kernel function elementwise_mul_kernel!(out, a, b)
+    i = @index(Global, Linear)
+    if i <= length(out)
+        @inbounds out[i] = a[i] * b[i]
+    end
+end
+
+function elementwise_mul!(out, a, b)
+    n = length(out)
+    kfn = elementwise_mul_kernel!(_GPU_BACKEND)
+    kfn(out, a, b; ndrange=(n,))
+    oneAPI.oneL0.synchronize()
+    return out
 end
 
 # ============================================================

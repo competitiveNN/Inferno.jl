@@ -48,8 +48,10 @@ end
 function rmsnorm_gpu!(out::AbstractArray, x::AbstractArray, weight::AbstractArray, eps::AbstractFloat)
     n = length(x)
     if n == 0 return out end
-    # GPU-accelerated BLAS dot product
-    sum_sq = dot(x, x)
+    # GPU-safe sum of squares (broadcast, not BLAS)
+    # oneAPI supports broadcast .^ and sum natively without oneMKL
+    x_sq = x .^ 2
+    sum_sq = oneAPI.oneAPI.sum(x_sq)
     # Normalize using the pre-computed sum
     kfn = rmsnorm_kernel!(_GPU_BACKEND)
     kfn(out, x, weight, eps, sum_sq; ndrange=(n,))

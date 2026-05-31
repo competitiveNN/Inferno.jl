@@ -94,7 +94,7 @@ function main()
     # Now test GPU on just ONE layer (first SSM layer + MLP)
     @info "Testing GPU forward on embedding + first layer..."
     
-    to_gpu(x) = x isa AbstractMatrix ? oneArray{Float16}(x) : oneArray{Float16}(vec(x))
+    to_gpu(x) = x isa AbstractMatrix ? oneArray{Float32}(x) : oneArray{Float32}(vec(x))
     
     @info "Uploading weights..."
     embed_gpu = to_gpu(cpu_model.embed)
@@ -114,18 +114,18 @@ function main()
     lm_head_gpu = to_gpu(cpu_model.lm_head)
     
     # GPU buffers
-    buf_h = oneArray{Float16}(undef, h)
-    buf_norm = oneArray{Float16}(undef, h)
-    buf_gate = oneArray{Float16}(undef, d_ff)
-    buf_up = oneArray{Float16}(undef, d_ff)
-    buf_out = oneArray{Float16}(undef, h)
+    buf_h = oneArray{Float32}(undef, h)
+    buf_norm = oneArray{Float32}(undef, h)
+    buf_gate = oneArray{Float32}(undef, d_ff)
+    buf_up = oneArray{Float32}(undef, d_ff)
+    buf_out = oneArray{Float32}(undef, h)
     
     # Warmup: JIT-compile kernels
     @info "Warming up GPU..."
     tiny_a = oneArray{Float16}(rand(Float32, 4, 4))
     tiny_x = oneArray{Float16}(rand(Float32, 4))
     gpu_mul!(oneArray{Float16}(undef, 4), tiny_a, tiny_x)
-    gpu_sum(oneArray{Float16}(rand(Float32, h)))
+    gpu_sum(oneArray{Float32}(rand(Float32, h)))
     @info "Warmup done"
     
     token = tokens[1]
@@ -145,7 +145,7 @@ function main()
     sum_sq = gpu_sum(buf_h .^ 2)
     @info "  Sum_sq: $(round((time()-t0)*1000))ms"
     t0 = time()
-    inv_rms = Float16(1.0f0) / Float16(sqrt(Float32(sum_sq / h) + cfg.rms_norm_eps))
+    inv_rms = 1.0f0 / sqrt(sum_sq / h + cfg.rms_norm_eps)
     buf_norm .= buf_h .* inv_rms .* in_norm_w
     @info "  Scale: $(round((time()-t0)*1000))ms"
     t0 = time()
@@ -155,12 +155,20 @@ function main()
     @info "  Gate matmul: $(round((time()-t0)*1000))ms"
     t0 = time()
     
+    # Verify gate matmul against CPU
+    cpu_gate_ref = mlp.gate_weight * Array(buf_norm)
+    gpu_gate = Array(buf_gate)
+    gate_sim = dot(gpu_gate, cpu_gate_ref) / (norm(gpu_gate) * norm(cpu_gate_ref))
+    @info "  Gate matmul cosine sim: $(round(gate_sim, digits=6))"
+    @info "  GPU gate range: $(round(minimum(gpu_gate), digits=4))..$(round(maximum(gpu_gate), digits=4))"
+    @info "  CPU gate range: $(round(minimum(cpu_gate_ref), digits=4))..$(round(maximum(cpu_gate_ref), digits=4))"
+    
     gpu_mul!(buf_up, mlp_up, buf_norm)
     @info "  Up matmul: $(round((time()-t0)*1000))ms"
     t0 = time()
     
     # SiLU + multiply
-    buf_gate .= buf_gate ./ (Float16(1.0f0) .+ exp.(-Float32.(buf_gate)))
+    buf_gate .= buf_gate ./ (1.0f0 .+ exp.(-buf_gate))
     buf_gate .= buf_gate .* buf_up
     @info "  SiLU+Mul: $(round((time()-t0)*1000))ms"
     t0 = time()

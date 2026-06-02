@@ -247,12 +247,12 @@ function update_kv_cache!(cache::KVCacheCPU, k::Matrix{Float32}, v::Matrix{Float
  # Manual copy to avoid allocation
  for h in 1:size(k, 2)
  for d in 1:size(k, 1)
- cache.k[d, h, pos] = k[d, h]
+ cache.k[d, h, pos + 1] = k[d, h]
  end
  end
  for h in 1:size(v, 2)
  for d in 1:size(v, 1)
- cache.v[d, h, pos] = v[d, h]
+ cache.v[d, h, pos + 1] = v[d, h]
  end
  end
  return cache

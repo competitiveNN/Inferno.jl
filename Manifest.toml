@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "12473e8732b09d7d622b6a03a5dab8df2c665d91"
+project_hash = "ade0bfc4da15cb6c6aca6c540df20741380fbd8b"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -287,7 +287,7 @@ uuid = "615f187c-cbe4-4ef1-ba3b-2fcf58d6d173"
 version = "0.1.1"
 
 [[deps.Inferno]]
-deps = ["Adapt", "ArgParse", "BFloat16s", "HTTP", "JSON", "JSON3", "KernelAbstractions", "Libdl", "LinearAlgebra", "LoopVectorization", "MKL", "Mmap", "NPZ", "OrderedCollections", "Printf", "REPL", "Random", "Sockets", "StaticArrays", "Statistics", "StructTypes", "Tar", "ThreadPools", "Unicode", "UnsafeAtomics", "oneAPI"]
+deps = ["Adapt", "ArgParse", "BFloat16s", "HTTP", "JSON", "JSON3", "KernelAbstractions", "Libdl", "LinearAlgebra", "LoopVectorization", "MKL", "Mmap", "NEO_jll", "NPZ", "OrderedCollections", "Printf", "REPL", "Random", "Sockets", "StaticArrays", "Statistics", "StructTypes", "Tar", "ThreadPools", "Unicode", "UnsafeAtomics", "oneAPI"]
 path = "."
 uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
 version = "0.1.0"
@@ -822,6 +822,18 @@ deps = ["ManualMemory"]
 git-tree-sha1 = "d969183d3d244b6c33796b5ed01ab97328f2db85"
 uuid = "8290d209-cae3-49c0-8002-c8c24d57dab5"
 version = "0.5.5"
+
+[[deps.TimerOutputs]]
+deps = ["ExprTools", "Printf"]
+git-tree-sha1 = "3748bd928e68c7c346b52125cf41fff0de6937d0"
+uuid = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
+version = "0.5.29"
+
+    [deps.TimerOutputs.extensions]
+    FlameGraphsExt = "FlameGraphs"
+
+    [deps.TimerOutputs.weakdeps]
+    FlameGraphs = "08572546-2f56-4bcf-ba4e-bab62c3a3f89"
 
 [[deps.Tracy]]
 deps = ["ExprTools", "LibTracyClient_jll", "Libdl"]

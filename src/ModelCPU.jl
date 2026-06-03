@@ -1117,16 +1117,6 @@ function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hid
  end
 end
 
-function top_k_projection_fast(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}, top_k::Int=256)
- vocab_size, hidden_size = size(weight)
- fill!(output, -Inf32)
- BLAS.gemv!('N', 1.0f0, weight, hidden, 0.0f0, output)
- k = min(vocab_size, top_k)
- partialsortperm!(output, 1:k, rev=true)
- output[k+1:end] .= -Inf32
- output[1:k]
-end
-
 # Use CommonOps.softmax_sample instead of local copy
 const softmax_sample = CommonOps.softmax_sample
 function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)

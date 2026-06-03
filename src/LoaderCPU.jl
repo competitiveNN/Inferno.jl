@@ -379,9 +379,7 @@ end
  push!(layers, layer)
  println(" Layer $i: $(layer.is_ssm ? "SSM" : "Attention")")
  end
- 
- ModelCPU.init_layer_counters!(length(layers))
- 
+
  # Load final norm
     final_norm_w = Float32.(extract_tensor_cpu(file, "output_norm.weight"))
     final_norm = ModelCPU.RMSNormCPU(final_norm_w, config.rms_norm_eps)

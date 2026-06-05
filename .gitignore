@@ -35,3 +35,5 @@ dump_tensors.cpp
 hermes_conversation_*.json
 tests/debug/
 *.mem
+.soulforge
+.keys

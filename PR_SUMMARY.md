@@ -7,7 +7,7 @@ Kept 4 most recent PRs with pending improvements:
 - **lm_head_project**: Zero-allocation with `@sync`/`Threads.@spawn`, direct slice writes
 - **sampling**: `partialsortperm` instead of full sort for top_k filtering
 
-## PR #86: lm_head Optimization
+## PR #86: lm_head Optimization ✅ MERGED
 - Eliminates allocations in `lm_head_project!`
 - Chunked parallel execution with direct output buffer writes
 
@@ -15,7 +15,7 @@ Kept 4 most recent PRs with pending improvements:
 - Interactive chat UX fixes
 - Bug fixes for streaming
 
-## PR #89: softmax_sample Filtering
+## PR #89: softmax_sample Filtering ✅ MERGED
 - Partial sort instead of full sort (O(N log k) vs O(N log N))
 - Eliminates Set allocations in hot sampling path
 

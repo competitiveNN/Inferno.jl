@@ -32,18 +32,19 @@ function __init__()
 end
 
 function _load_libquant()
-    _force_disabled[] && return false
-    if !_libquant_loaded[]
-        if isfile(LIBQUANT_PATH)
-            _libquant_loaded[] = true
-            # Set OpenMP threads to match available cores
-            n = clamp(Sys.CPU_THREADS ÷ 2, 2, 8)
-            ENV["OMP_NUM_THREADS"] = get(ENV, "OMP_NUM_THREADS", string(n))
-        else
-            @warn "Quantized C kernel not found at $LIBQUANT_PATH - falling back to Julia"
-        end
-    end
-    return _libquant_loaded[]
+ _force_disabled[] && return false
+ if !_libquant_loaded[]
+ if isfile(LIBQUANT_PATH)
+ _libquant_loaded[] = true
+ # Set OpenMP threads to match available cores
+ n = clamp(Sys.CPU_THREADS ÷ 2, 2, 8)
+ ENV["OMP_NUM_THREADS"] = get(ENV, "OMP_NUM_THREADS", string(n))
+ elseif !_quant_missing_warned[]
+ _quant_missing_warned[] = true
+ @debug "Quantized C kernel not found at $LIBQUANT_PATH - falling back to Julia"
+ end
+ end
+ return _libquant_loaded[]
 end
 
 """Check if C SIMD kernels are available (and not disabled by INFERNO_NO_QUANT_KERNELS)."""
@@ -57,6 +58,7 @@ const Q8_K_BLOCK_BYTES = 292
 # ============================================================================
 
 const _q8_bufs = Dict{Int, Vector{UInt8}}()
+const _quant_missing_warned = Ref{Bool}(false)
 
 function get_q8_k_buffer(inner_dim::Int)
     @assert inner_dim % 256 == 0 "Q8_K requires inner_dim divisible by 256, got $inner_dim"

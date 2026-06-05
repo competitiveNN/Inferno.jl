@@ -438,7 +438,7 @@ function read_line_chat(term, state)
     end
 end
 
-function chat!(model, tok; system_prompt::String="You are a helpful assistant.", enable_thinking::Bool=false, max_tokens::Int=512, temperature::Float32=1.0f0, top_p::Float32=0.95f0, top_k::Int=20, repetition_penalty::Float32=1.0f0, presence_penalty::Float32=0.0f0, min_p::Float32=0.0f0, show_tps::Bool=true, kwargs...)
+function chat!(model, tok; system_prompt::String="You are a helpful assistant.", enable_thinking::Bool=false, max_tokens::Int=512, temperature=1.0, top_p=0.95, top_k::Int=20, repetition_penalty=1.0, presence_penalty=0.0, min_p=0.0, show_tps::Bool=true, kwargs...)
  messages = [Message(:system, system_prompt)]
  thinking_mode = enable_thinking
  

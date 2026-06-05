@@ -2,7 +2,7 @@
 
 Kept 4 most recent PRs with pending improvements:
 
-## PR #85: CPU Inference Optimizations
+## PR #85: CPU Inference Optimizations ✅ MERGED
 - **FlashAttention**: Pre-allocated scores buffer, @turbo for vectorization, fused block max
 - **lm_head_project**: Zero-allocation with `@sync`/`Threads.@spawn`, direct slice writes
 - **sampling**: `partialsortperm` instead of full sort for top_k filtering

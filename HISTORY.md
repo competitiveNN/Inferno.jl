@@ -38,6 +38,14 @@ Flash attention was integrated into `FullAttentionCPU`, enabled by default. Key 
 - Online softmax avoids materializing full attention matrix
 - Benchmarks: 8-13.7x speedup vs standard attention at typical sequence lengths
 
+### Phase 2.8: FlashAttention CPU Optimizations (PR #85)
+
+Further optimized `flash_attention_cpu!` in `src/FlashAttention.jl`:
+- Pre-allocated scores buffer outside block loop (eliminates per-block `zeros` allocation)
+- Fused max tracking during score computation (single pass, no `maximum(scores)` second pass)
+- Upgraded `@simd` → `@turbo` for LoopVectorization SIMD
+- Explicit `return output` for clarity
+
 ### Phase 2.7: Threading Tuning
 
 Based on profiling:

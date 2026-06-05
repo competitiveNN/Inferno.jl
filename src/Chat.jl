@@ -438,7 +438,7 @@ function read_line_chat(term, state)
     end
 end
 
-function chat!(model, tok; system_prompt::String="You are a helpful assistant.", enable_thinking::Bool=false, kwargs...)
+function chat!(model, tok; system_prompt::String="You are a helpful assistant.", enable_thinking::Bool=false, max_tokens::Int=512, temperature::Float32=1.0f0, top_p::Float32=0.95f0, top_k::Int=20, repetition_penalty::Float32=1.0f0, presence_penalty::Float32=0.0f0, min_p::Float32=0.0f0, show_tps::Bool=true, kwargs...)
  messages = [Message(:system, system_prompt)]
  thinking_mode = enable_thinking
  
@@ -499,7 +499,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
-response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
+response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=max_tokens, io=term, thinking_enabled=thinking_mode, show_tps=show_tps, temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p, kwargs...)
    
    # Print newline after response
    println(term)

@@ -207,6 +207,13 @@ if isdir(SAFETENSORS_MODEL_PATH)
         @test state.tokens_generated == 5
         # KV caches should be preserved (same object)
         @test length(state.caches) == model.config.num_hidden_layers
+
+        # Test generate_batch
+        prompts = ["Hello", "AI"]
+        state2 = Inferno.ModelCPU.create_generation_state(model; max_context=2048)
+        outputs = Inferno.ModelCPU.generate_batch(model, tok, prompts, state2; max_tokens=5, temperature=0.7f0)
+        @test length(outputs) == 2
+        @test all(length(o) > 0 for o in outputs)
     end
 else
     @warn "Safetensors model not found at $SAFETENSORS_MODEL_PATH, skipping Safetensors Model Loading test"

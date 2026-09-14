@@ -51,7 +51,7 @@ using BFloat16s
 using Printf
 
 export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU, QuantOrFloat32
-export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu, generate_with_cache, GenerationState, create_generation_state
+export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu, generate_with_cache, GenerationState, create_generation_state, generate_batch
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfigCPU
@@ -1445,6 +1445,64 @@ catch e
     end
     
     return decode_fn(all_tokens)
+ end
+
+ """
+    generate_batch(model, tokenizer, prompts, state::GenerationState; kwargs...)
+
+ Generate text for multiple prompts sequentially using shared KV caches.
+ Pre-allocated cache buffers are reused across all prompts, avoiding repeated
+ allocation of ~400MB+ per call. Each prompt is processed one at a time.
+
+ # Arguments
+ - `model`: The QwenModelCPU
+ - `tok`: Tokenizer (SimpleTokenizer or BPETokenizer)
+ - `prompts`: Vector of prompt strings
+ - `state`: Pre-allocated GenerationState with KV caches
+
+ # Keyword Arguments
+ - `max_tokens`: Maximum tokens to generate per prompt (default: 256)
+ - `temperature`: Sampling temperature (default: 0.7)
+ - `top_p`: Nucleus sampling threshold (default: 0.9)
+ - `top_k`: Top-k filtering, 0 to disable (default: 40)
+ - `repetition_penalty`: Penalty for repeated tokens (default: 1.1)
+
+ # Example
+ ```julia
+ state = create_generation_state(model; max_context=8192)
+ prompts = ["Hello", "What is AI?", "Tell me a story"]
+ outputs = generate_batch(model, tok, prompts, state; max_tokens=20)
+ ```
+ """
+ function generate_batch(model::QwenModelCPU, tok, prompts::Vector{String}, state::GenerationState;
+    max_tokens::Int=256,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.9f0,
+    top_k::Int=40,
+    repetition_penalty::Float32=1.1f0)
+
+    stop_tokens = Set{Int}()
+    push!(stop_tokens, tok.eos_id)
+
+    encode_fn = (p) -> getfield(parentmodule(typeof(tok)), :encode)(tok, p)
+    decode_fn = (ids) -> getfield(parentmodule(typeof(tok)), :decode)(tok, ids)
+
+    results = String[]
+    for prompt in prompts
+        prompt_tokens = encode_fn(prompt)
+        if isempty(prompt_tokens)
+            push!(results, "")
+            continue
+        end
+        # Reset only the tracking state, not the KV cache buffers
+        reset_state!(state, model)
+        output = _generate_from_state(model, prompt_tokens, decode_fn, state;
+            max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, stop_tokens=stop_tokens)
+        push!(results, output)
+    end
+
+    return results
  end
 
  """

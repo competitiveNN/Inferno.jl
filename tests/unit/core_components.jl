@@ -188,6 +188,25 @@ if isdir(SAFETENSORS_MODEL_PATH)
         # Generate a few tokens and verify output is non-empty
         output = Inferno.generate_text(model, tok, prompt; max_tokens=10, temperature=0.7f0)
         @test length(output) > 0
+
+        # Test KV cache persistence (GenerationState)
+        state = Inferno.ModelCPU.create_generation_state(model; max_context=2048)
+        @test state isa Inferno.ModelCPU.GenerationState
+        @test state.max_seq > 0
+        @test length(state.caches) == model.config.num_hidden_layers
+
+        # generate_text with state should produce output
+        output_with_state = Inferno.generate_text(model, tok, prompt, state; max_tokens=10, temperature=0.7f0)
+        @test length(output_with_state) > 0
+        @test state.tokens_generated == 10
+
+        # Reusing the same state should reset and produce new output
+        # (reset_state! resets tokens_generated to 0 at the start of each call)
+        output2 = Inferno.generate_text(model, tok, prompt, state; max_tokens=5, temperature=0.7f0)
+        @test length(output2) > 0
+        @test state.tokens_generated == 5
+        # KV caches should be preserved (same object)
+        @test length(state.caches) == model.config.num_hidden_layers
     end
 else
     @warn "Safetensors model not found at $SAFETENSORS_MODEL_PATH, skipping Safetensors Model Loading test"

@@ -204,6 +204,58 @@ function generate_text(model::ModelCPU.QwenModelCPU, tok::Tokenizer.BPETokenizer
 end
 
 """
+    generate_text(model, tokenizer, prompt, state::ModelCPU.GenerationState; kwargs...)
+
+Generate text using pre-allocated KV caches from `GenerationState`.
+This avoids the ~800MB allocation per call by reusing caches.
+
+# Example
+```julia
+state = ModelCPU.create_generation_state(model; max_context=8192)
+output1 = generate_text(model, tok, "Hello", state; max_tokens=20)
+# Continue with same state
+output2 = generate_text(model, tok, "World", state; max_tokens=20)
+```
+"""
+function generate_text(model::ModelCPU.QwenModelCPU, tok::SimpleTokenizer, prompt::String,
+    state::ModelCPU.GenerationState;
+    max_tokens::Int=256,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.9f0,
+    top_k::Int=40,
+    repetition_penalty::Float32=1.1f0,
+    stop_tokens::Set{Int}=Set{Int}())
+
+    push!(stop_tokens, tok.eos_id)
+    prompt_tokens = encode(tok, prompt)
+    if isempty(prompt_tokens)
+        return ""
+    end
+    return ModelCPU.generate_with_cache(model, tok, prompt, state;
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+        repetition_penalty=repetition_penalty, stop_tokens=stop_tokens)
+end
+
+function generate_text(model::ModelCPU.QwenModelCPU, tok::Tokenizer.BPETokenizer, prompt::String,
+    state::ModelCPU.GenerationState;
+    max_tokens::Int=256,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.9f0,
+    top_k::Int=40,
+    repetition_penalty::Float32=1.1f0,
+    stop_tokens::Set{Int}=Set{Int}())
+
+    push!(stop_tokens, tok.eos_id)
+    prompt_tokens = encode(tok, prompt)
+    if isempty(prompt_tokens)
+        return ""
+    end
+    return ModelCPU.generate_with_cache(model, tok, prompt, state;
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+        repetition_penalty=repetition_penalty, stop_tokens=stop_tokens)
+end
+
+"""
     chat(model, tokenizer, messages; kwargs...)
 
 Chat-style generation with message history.

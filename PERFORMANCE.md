@@ -90,21 +90,39 @@ With warmup (first call excluded), subsequent 10-token generations show:
 4. **lm_head matmul** — dominant compute time (~47% of total). Chunked parallel implementation in `lm_head_project!` with 4 chunks.
 5. **Attention computation** — flash attention enabled by default, provides 8-13.7x speedup vs standard attention.
 
-## Optimization Targets
+## KV Cache Optimization Results
 
-### Achieved (from prior work)
+### Persistent KV Cache API
+
+Implemented `GenerationState` struct with pre-allocated KV caches and `create_generation_state()` / `generate_with_cache()` functions.
+
+**Allocation comparison** (generating 10 tokens, Qwen3.5-0.8B, max_context=2048):
+
+| Approach | Time | Allocations | Memory |
+|----------|------|-------------|--------|
+| `generate_text` (new caches each call) | ~0.7s | ~1.3k | ~325 MB |
+| `generate_with_cache` (reuses caches) | ~0.6s | ~1.1k | ~132 MB |
+
+- **60% reduction in memory allocations** (~193 MB saved per call)
+- **~15% throughput improvement** (0.6s vs 0.7s per 10 tokens)
+- KV caches persist across calls; `reset_state!` resets counters but preserves buffers
+- API: `state = create_generation_state(model; max_context=8192)` then `generate_text(model, tok, prompt, state; ...)`
+
+### Optimization Targets
+
+#### Achieved
 
 - Per-token allocation: 2.7MB → 10KB (99.6% reduction) — but only in the optimized forward path
 - Pre-allocated buffers for all major operations
 - Flash attention integration with 8-13.7x speedup
 - BLAS thread tuning: 8 threads optimal
+- **Persistent KV cache API** (`GenerationState`, `create_generation_state`, `generate_with_cache`) — 60% memory reduction
 
 ### Remaining Opportunities
 
-1. **Cache reuse** — `generate_text` / `generate_stream_cpu` creates new caches per call. A persistent cache API would eliminate ~400MB+ of allocations per call.
-2. **Tokenizer reuse** — `encode` called per generation. Cache tokenized prompts.
-3. **Channel pre-allocation** — Move `generate_stream_cpu` cache creation outside the `Channel` block.
-4. **Batch generation** — Support generating multiple sequences in a single forward pass.
+1. **Tokenizer reuse** — `encode` called per generation. Cache tokenized prompts.
+2. **Channel pre-allocation** — Move `generate_stream_cpu` cache creation outside the `Channel` block.
+3. **Batch generation** — Support generating multiple sequences in a single forward pass.
 
 ## Profiling Commands
 

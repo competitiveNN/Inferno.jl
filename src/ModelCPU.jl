@@ -51,7 +51,7 @@ using BFloat16s
 using Printf
 
 export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU, QuantOrFloat32
-export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu
+export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu, generate_with_cache, GenerationState, create_generation_state
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfigCPU
@@ -985,6 +985,45 @@ end
  end
 end
 
+"""
+    GenerationState
+
+Persistent generation state with pre-allocated KV caches.
+Avoids ~800MB allocation per generation call by reusing caches.
+
+# Example
+```julia
+state = create_generation_state(model; max_context=8192)
+output = generate_with_cache(model, tokenizer, "Hello", state; max_tokens=50)
+# Continue generation with same state
+more = generate_with_cache(model, tokenizer, "World", state; max_tokens=20)
+```
+"""
+mutable struct GenerationState
+    caches::Vector{KVCacheCPU}
+    max_seq::Int
+    token_counts::Dict{Int,Int}
+    last_token::Int
+    curr_pos::Int
+    tokens_generated::Int
+end
+
+function create_generation_state(model::QwenModelCPU; max_context::Int=8192)
+    max_cache_seq = min(model.config.max_position_embeddings, max_context)
+    caches = [init_kv_cache_cpu(model.config, max_cache_seq) for _ in 1:model.config.num_hidden_layers]
+    reset_states_cpu!(model)
+    return GenerationState(caches, max_cache_seq, Dict{Int,Int}(), 0, 0, 0)
+end
+
+function reset_state!(state::GenerationState, model::QwenModelCPU)
+    reset_states_cpu!(model)
+    state.token_counts = Dict{Int,Int}()
+    state.last_token = 0
+    state.curr_pos = 0
+    state.tokens_generated = 0
+    return state
+end
+
 function reset_states_cpu!(model::QwenModelCPU)
     for layer in model.layers
         if layer.is_ssm
@@ -1296,9 +1335,119 @@ catch e
  end
  end
  end
-end
+ end
 
-"""
+ """
+    generate_with_cache(model, tokenizer, prompt, state::GenerationState; kwargs...)
+
+ Generate text using pre-allocated KV caches from `GenerationState`.
+ This avoids the ~800MB allocation per call that `generate_text` incurs.
+
+ # Arguments
+ - `model`: The QwenModelCPU
+ - `tok`: Tokenizer (SimpleTokenizer or BPETokenizer)
+ - `prompt`: Text prompt
+ - `state`: Pre-allocated GenerationState with KV caches
+
+ # Keyword Arguments
+ - `max_tokens`: Maximum tokens to generate (default: 256)
+ - `temperature`: Sampling temperature (default: 0.7)
+ - `top_p`: Nucleus sampling threshold (default: 0.9)
+ - `top_k`: Top-k filtering, 0 to disable (default: 40)
+ - `repetition_penalty`: Penalty for repeated tokens (default: 1.1)
+ - `stop_tokens`: Set of stop token IDs (default: includes EOS)
+
+ # Example
+ ```julia
+ state = create_generation_state(model; max_context=8192)
+ output1 = generate_with_cache(model, tok, "Hello", state; max_tokens=20)
+ # Continue generation with same state (reuses KV caches)
+ output2 = generate_with_cache(model, tok, "World", state; max_tokens=20)
+ ```
+ """
+ function generate_with_cache(model::QwenModelCPU, tok, prompt::String, state::GenerationState;
+    max_tokens::Int=256,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.9f0,
+    top_k::Int=40,
+    repetition_penalty::Float32=1.1f0,
+    stop_tokens::Set{Int}=Set{Int}())
+    
+    push!(stop_tokens, tok.eos_id)
+    
+    prompt_tokens = getfield(parentmodule(typeof(tok)), :encode)(tok, prompt)
+    if isempty(prompt_tokens)
+        return ""
+    end
+    
+    decode_fn = (ids) -> getfield(parentmodule(typeof(tok)), :decode)(tok, ids)
+    
+    return _generate_from_state(model, prompt_tokens, decode_fn, state;
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+        repetition_penalty=repetition_penalty, stop_tokens=stop_tokens)
+    end
+
+ function _generate_from_state(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function,
+    state::GenerationState; max_tokens::Int=256, temperature::Float32=1.0f0,
+    top_p::Float32=0.95f0, top_k::Int=0, repetition_penalty::Float32=1.0f0,
+    presence_penalty::Float32=0.0f0, min_p::Float32=0.0f0,
+    stop_tokens::Set{Int}=Set{Int}())
+    
+    caches = state.caches
+    token_counts = state.token_counts
+    
+    # Reset state tracking
+    reset_state!(state, model)
+    
+    # Process prompt tokens
+    curr_pos = 0
+    all_tokens = Int[]
+    
+    if !isempty(prompt_tokens)
+        logits = forward_cpu!(model, prompt_tokens, 0, caches)
+        curr_pos = length(prompt_tokens)
+        
+        first_logits_vec = vec(logits[:, end])
+        apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
+        apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
+        
+        next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+        
+        curr_pos += 1
+        token_counts[next_token] = get(token_counts, next_token, 0) + 1
+        push!(all_tokens, next_token)
+        
+        state.last_token = next_token
+        state.curr_pos = curr_pos
+        state.tokens_generated = 1
+        
+        if next_token in stop_tokens
+            return decode_fn(all_tokens)
+        end
+    end
+    
+    # Generate remaining tokens
+    while state.tokens_generated < max_tokens
+        next_token, _ = generate_cpu(model, [state.last_token], state.curr_pos, caches;
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, token_counts=token_counts,
+            presence_penalty=presence_penalty, min_p=min_p)
+        
+        if next_token in stop_tokens
+            break
+        end
+        
+        state.curr_pos += 1
+        token_counts[next_token] = get(token_counts, next_token, 0) + 1
+        state.last_token = next_token
+        state.tokens_generated += 1
+        push!(all_tokens, next_token)
+    end
+    
+    return decode_fn(all_tokens)
+ end
+
+ """
     stream_to_stdout_cpu(model, prompt_tokens, decode_fn; kwargs...)
 
 Generate tokens and print them to stdout as they are produced.

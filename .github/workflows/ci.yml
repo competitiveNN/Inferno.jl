@@ -1,0 +1,32 @@
+name: Inferno.jl CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ["1.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Julia ${{ matrix.julia-version }}
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Install dependencies
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Run tests
+        run: julia --project=. -e 'using Pkg; Pkg.test()'
+
+      - name: Check for precompilation errors
+        run: julia --project=. -e 'using Inferno; @info "Inferno loaded successfully"'

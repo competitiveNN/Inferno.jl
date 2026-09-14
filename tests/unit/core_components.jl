@@ -166,6 +166,33 @@ end
 end
 
 
+# Safetensors integration test (if model is available at known path)
+const SAFETENSORS_MODEL_PATH = get(ENV, "INFERNO_SAFETENSORS_MODEL", "/run/host/var/home/fra/data/models/safetensors/Qwen3.5-0.8B")
+if isdir(SAFETENSORS_MODEL_PATH)
+    @testset "Safetensors Model Loading" begin
+        model, tok = Inferno.load_safetensors_model(SAFETENSORS_MODEL_PATH)
+
+        @test model isa Inferno.ModelCPU.QwenModelCPU
+        @test tok isa Inferno.Tokenizer.BPETokenizer
+        @test length(tok.id_to_token) > 0
+        @test model.config.hidden_size > 0
+        @test length(model.layers) == model.config.num_hidden_layers
+
+        # Tokenize and decode roundtrip
+        prompt = "Hello"
+        ids = Inferno.Tokenizer.encode(tok, prompt)
+        decoded = Inferno.Tokenizer.decode(tok, ids)
+        @test length(ids) > 0
+        @test length(decoded) > 0
+
+        # Generate a few tokens and verify output is non-empty
+        output = Inferno.generate_text(model, tok, prompt; max_tokens=10, temperature=0.7f0)
+        @test length(output) > 0
+    end
+else
+    @warn "Safetensors model not found at $SAFETENSORS_MODEL_PATH, skipping Safetensors Model Loading test"
+end
+
 @testset "Server Prompt Building" begin
     using Inferno.Server
 

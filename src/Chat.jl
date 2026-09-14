@@ -7,7 +7,7 @@ module Chat
 
 using Base.Terminals
 using Base: join
-using ..Inferno: stream_to_stdout, generate_cpu, generate_stream_cpu
+using ..Inferno: stream_to_stdout, generate_stream_cpu
 using ..Inferno.Tokenizer: encode, decode
 
 export chat!, start_chat, Message, build_prompt
@@ -145,7 +145,7 @@ const chat_terminal = Ref{Any}(nothing)
 
 function check_interrupt()
     if interrupt_flag[]
-        interrupt_flag[], false
+        interrupt_flag[] = false
         return true
     end
     # Try to check if there's input available on terminal
@@ -251,12 +251,6 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
-        end
-        
         if c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
             println(term)
@@ -357,13 +351,34 @@ function read_line_chat(term, state)
                     refresh_line(term, "You> ", buffer, cursor)
                 elseif seq == 'C'
                     if cursor <= length(buffer)
-                        print(term, buffer[cursor])
-                        cursor += 1
+                         print(term, buffer[cursor])
+                         cursor += 1
                     end
                 elseif seq == 'D'
                     if cursor > 1
                         cursor -= 1
                         print(term, "\b")
+                    end
+                elseif seq == 'H' # Home
+                    cursor = 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == 'F' # End
+                    cursor = length(buffer) + 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == '1' || seq == '3' || seq == '4'
+                    # Handle \e[1~ (Home), \e[3~ (Delete), \e[4~ (End)
+                    suffix = read(term, Char)
+                    if suffix == '~'
+                        if seq == '1'
+                            cursor = 1
+                        elseif seq == '4'
+                            cursor = length(buffer) + 1
+                        elseif seq == '3'
+                            if cursor <= length(buffer)
+                                deleteat!(buffer, cursor)
+                            end
+                        end
+                        refresh_line(term, "You> ", buffer, cursor)
                     end
                 end
             elseif next == '\x7f'

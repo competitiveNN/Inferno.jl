@@ -13,43 +13,48 @@ using Inferno
 using Statistics
 
 const MODEL_PATH = get(ENV, "INFERNO_MODEL", "test/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+const MODEL_EXISTS = isfile(MODEL_PATH)
 
-@testset "GGUF Parsing" begin
-    file = Inferno.GGUF.read_gguf(MODEL_PATH)
+if MODEL_EXISTS
+    @testset "GGUF Parsing" begin
+        file = Inferno.GGUF.read_gguf(MODEL_PATH)
 
-    @test length(file.metadata) > 0
-    @test length(file.tensors) > 0
-    @test file.data_offset > 0
+        @test length(file.metadata) > 0
+        @test length(file.tensors) > 0
+        @test file.data_offset > 0
 
-    # Check expected metadata keys
-    @test haskey(file.metadata, "general.architecture")
-    arch = file.metadata["general.architecture"]
-    @test arch == "qwen35"
+        # Check expected metadata keys
+        @test haskey(file.metadata, "general.architecture")
+        arch = file.metadata["general.architecture"]
+        @test arch == "qwen35"
 
-    # Model-specific keys use arch prefix
-    @test haskey(file.metadata, "$(arch).block_count")
-    @test haskey(file.metadata, "$(arch).embedding_length")
+        # Model-specific keys use arch prefix
+        @test haskey(file.metadata, "$(arch).block_count")
+        @test haskey(file.metadata, "$(arch).embedding_length")
 
-    # Check some expected tensors exist
-    @test haskey(file.tensors, "token_embd.weight")
-    @test haskey(file.tensors, "blk.0.attn_qkv.weight")
-    @test haskey(file.tensors, "output_norm.weight")
-end
+        # Check some expected tensors exist
+        @test haskey(file.tensors, "token_embd.weight")
+        @test haskey(file.tensors, "blk.0.attn_qkv.weight")
+        @test haskey(file.tensors, "output_norm.weight")
+    end
 
-@testset "Tokenizer" begin
-    file = Inferno.GGUF.read_gguf(MODEL_PATH)
-    tok = Inferno.Tokenizer.load_tokenizer(file.metadata)
+    @testset "Tokenizer" begin
+        file = Inferno.GGUF.read_gguf(MODEL_PATH)
+        tok = Inferno.Tokenizer.load_tokenizer(file.metadata)
 
-    @test length(tok.id_to_token) > 0
-    @test tok.eos_id > 0
+        @test length(tok.id_to_token) > 0
+        @test tok.eos_id > 0
 
-    # Encode simple ASCII text
-    ids = Inferno.Tokenizer.encode(tok, "Hello")
-    @test length(ids) > 0
+        # Encode simple ASCII text
+        ids = Inferno.Tokenizer.encode(tok, "Hello")
+        @test length(ids) > 0
 
-    # Decode back
-    decoded = Inferno.Tokenizer.decode(tok, ids)
-    @test occursin("Hello", decoded) || occursin("hello", decoded) || length(decoded) > 0
+        # Decode back
+        decoded = Inferno.Tokenizer.decode(tok, ids)
+        @test occursin("Hello", decoded) || occursin("hello", decoded) || length(decoded) > 0
+    end
+else
+    @warn "Model not found at $MODEL_PATH, skipping GGUF Parsing and Tokenizer tests"
 end
 
 @testset "RMSNorm" begin
@@ -65,10 +70,12 @@ end
     x_cpu = rand(Float16, hidden_size, seq_len)
     w_cpu = rand(Float16, hidden_size)
 
-    # Expected output mathematically
-    m = sum(x_cpu .* x_cpu, dims=1) .* (Float16(1.0) / Float16(hidden_size))
-    inv_rms = Float16(1.0) ./ sqrt.(m .+ eps)
-    expected = x_cpu .* inv_rms .* w_cpu
+    # Expected output mathematically using Float32 for accumulation to avoid Float16 sum underflow,
+    # and converting scale to Float16 before multiplication to match the library's implementation.
+    x_f32 = Float32.(x_cpu)
+    m = sum(x_f32 .* x_f32, dims=1) ./ Float32(hidden_size)
+    scale = Float16.(1.0f0 ./ sqrt.(m .+ Float32(eps)))
+    expected = x_cpu .* scale .* w_cpu
 
     # Test CPU RMSNorm (always works)
     norm = Inferno.Model.RMSNorm(w_cpu, eps)
@@ -80,9 +87,10 @@ end
     seq_len = 10
     x_cpu_batch = rand(Float16, hidden_size, seq_len)
 
-    m_batch = sum(x_cpu_batch .* x_cpu_batch, dims=1) .* (Float16(1.0) / Float16(hidden_size))
-    inv_rms_batch = Float16(1.0) ./ sqrt.(m_batch .+ eps)
-    expected_batch = x_cpu_batch .* inv_rms_batch .* w_cpu
+    x_batch_f32 = Float32.(x_cpu_batch)
+    m_batch = sum(x_batch_f32 .* x_batch_f32, dims=1) ./ Float32(hidden_size)
+    scale_batch = Float16.(1.0f0 ./ sqrt.(m_batch .+ Float32(eps)))
+    expected_batch = x_cpu_batch .* scale_batch .* w_cpu
 
     norm_batch = Inferno.Model.RMSNorm(w_cpu, eps)
     res_cpu_batch = norm_batch(x_cpu_batch)
@@ -111,19 +119,23 @@ end
     end
 end
 
-@testset "Config Extraction" begin
-    file = Inferno.GGUF.read_gguf(MODEL_PATH)
-    arch = get(file.metadata, "general.architecture", "llm")
+if MODEL_EXISTS
+    @testset "Config Extraction" begin
+        file = Inferno.GGUF.read_gguf(MODEL_PATH)
+        arch = get(file.metadata, "general.architecture", "llm")
 
-    block_count = Int(file.metadata["$(arch).block_count"])
-    hidden_size = Int(file.metadata["$(arch).embedding_length"])
-    num_heads = Int(file.metadata["$(arch).attention.head_count"])
-    num_kv_heads = Int(file.metadata["$(arch).attention.head_count_kv"])
+        block_count = Int(file.metadata["$(arch).block_count"])
+        hidden_size = Int(file.metadata["$(arch).embedding_length"])
+        num_heads = Int(file.metadata["$(arch).attention.head_count"])
+        num_kv_heads = Int(file.metadata["$(arch).attention.head_count_kv"])
 
-    @test block_count == 24
-    @test hidden_size == 1024
-    @test num_heads == 8
-    @test num_kv_heads == 2
+        @test block_count == 24
+        @test hidden_size == 1024
+        @test num_heads == 8
+        @test num_kv_heads == 2
+    end
+else
+    @warn "Model not found, skipping Config Extraction test"
 end
 
 @testset "Dequantization Kernels (CPU)" begin

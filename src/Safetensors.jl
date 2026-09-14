@@ -297,7 +297,12 @@ post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w) .+ 1.0f0), model_confi
             mlp = load_mlp_safetensors(sf, layer_idx, model_config)
         end
         
-        push!(layers, ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm))
+        # Pre-allocate norm buffers
+        hidden_size = model_config.hidden_size
+        norm_buf1 = zeros(Float32, hidden_size)
+        norm_buf2 = zeros(Float32, hidden_size)
+        
+        push!(layers, ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm, norm_buf1, norm_buf2))
     end
     
     # Load final norm
@@ -317,16 +322,24 @@ final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w) .+ 1.0f0), model_con
     println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
     
     # LM head (tied with embedding for Qwen)
-    lm_head = embed'
+    lm_head = Matrix{Float32}(embed')
     
     # Create RoPE
     rotary_dim = round(Int, model_config.head_dim * model_config.partial_rotary_factor)
     rope = ModelCPU.RotaryEmbeddingCPU(model_config.head_dim, model_config.rope_theta, model_config.max_position_embeddings; rotary_dim=rotary_dim)
     
+    # Pre-allocated buffers
+    embed_buf = Vector{Float32}(undef, model_config.hidden_size)
+    final_norm_buf = Vector{Float32}(undef, model_config.hidden_size)
+    lm_head_buf = Vector{Float32}(undef, model_config.vocab_size)
+    mtp = nothing
+    
     # Load tokenizer
     tokenizer = load_hf_tokenizer(model_dir)
     
-    return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope), tokenizer
+    lm_head = Matrix{Float32}(embed')
+    
+    return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope, embed_buf, final_norm_buf, lm_head_buf, mtp), tokenizer
 end
 
 """
@@ -485,13 +498,12 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
  elseif occursin("linear_attn.in_proj_a", name)
  tensor = get_tensor(sf, name)
  # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
- # ModelCPU expects (hidden_size, num_v_heads) = (1024, 16) for: weight' * x
- # Need to transpose
- alpha_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
+ # ModelCPU expects (num_v_heads, hidden_size) = (16, 1024) for: weight * x
+ alpha_weight = Matrix{Float32}(tensor) # Keep as (16, 1024)
  elseif occursin("linear_attn.in_proj_b", name)
  tensor = get_tensor(sf, name)
- # Same as alpha - transpose to match ModelCPU expectation
- beta_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
+ # Same as alpha - keep as-is to match ModelCPU expectation
+ beta_weight = Matrix{Float32}(tensor) # Keep as (16, 1024)
         elseif occursin("linear_attn.out_proj", name)
             tensor = get_tensor(sf, name)
             ssm_out = Matrix{Float32}(tensor)  # (1024, 2048) - no transpose needed
@@ -681,7 +693,9 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  n_heads, n_kv, head_dim,
  Float32(1.0 / sqrt(head_dim)),
  qkv_buf, k_buf, v_buf,
- query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf
+ query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf,
+ Vector{Float32}(undef, head_dim),
+ false
  )
 end
 

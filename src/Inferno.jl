@@ -1,6 +1,7 @@
 module Inferno
 
 using Printf
+using oneAPI
 
 # GPU backend (optional)
 include("GPUInit.jl")

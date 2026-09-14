@@ -21,10 +21,15 @@ include("unit/core_components.jl")
 # ===================
 # Diagnostic Tests (require model)
 # ===================
+const SAFETENSORS_MODEL_PATH = get(ENV, "INFERNO_SAFETENSORS_MODEL", "/run/host/var/home/fra/data/models/safetensors/Qwen3.5-0.8B")
+if isdir(SAFETENSORS_MODEL_PATH)
+    @info "Running end-to-end generation pipeline with safetensors model"
+    include("diagnostics/check_generation_pipeline.jl")
+end
+
+# BFloat16 support check
 if MODEL_EXISTS
     @info "Running diagnostic tests with model: $MODEL_PATH"
-    
-    # BFloat16 support check
     include("diagnostics/check_bfloat16.jl")
 end
 

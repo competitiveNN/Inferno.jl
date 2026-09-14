@@ -127,14 +127,27 @@ Implemented `GenerationState` struct with pre-allocated KV caches and `create_ge
 ## Profiling Commands
 
 ```bash
-# Quick throughput check (30 tokens, sampling)
-julia --project=. /tmp/perf.jl
-
-# Memory allocation breakdown
-julia --project=. /tmp/bench4.jl
-
 # Full test suite
 julia --project=. -e 'using Pkg; Pkg.test()'
+
+# Memory profiling: compare create-each-call vs cached approach
+julia --project=. -e '
+using Inferno
+model, tok = Inferno.load_safetensors_model("/run/host/var/home/fra/data/models/safetensors/Qwen3.5-0.8B")
+
+# Create-each-call approach (baseline)
+println("=== Create-each-call ===")
+for i in 1:5
+    @time Inferno.generate_text(model, tok, "Hello", Inferno.ModelCPU.create_generation_state(model; max_context=2048); max_tokens=10, temperature=0.7f0)
+end
+
+# Cached approach (reuse)
+println("\n=== Cached ===")
+state = Inferno.ModelCPU.create_generation_state(model; max_context=2048)
+for i in 1:5
+    @time Inferno.generate_text(model, tok, "Hello", state; max_tokens=10, temperature=0.7f0)
+end
+'
 ```
 
 ## Verified Output Quality
@@ -143,3 +156,4 @@ Generation produces coherent multi-token text matching HuggingFace Qwen3.5 refer
 - `"What is 2 + 2 ?"` → `2 + 2 = 4 ...`
 - `"The capital of France is"` → coherent text about French geography
 - Minimum 64-128 tokens verified for coherence
+- End-to-end pipeline test confirms 11 subtests pass across model loading, generation, GenerationState, and generate_batch

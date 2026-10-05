@@ -227,29 +227,26 @@ end
 Decode token IDs back to a UTF-8 string.
 """
 function decode(tok::BPETokenizer, ids::Vector{Int})
-    bytes_arr = UInt8[]
+    output = IOBuffer()
     for id in ids
         if 1 <= id <= length(tok.id_to_token)
             s = tok.id_to_token[id]
             m = match(r"^<0x([0-9A-Fa-f]{2})>$", s)
             if m !== nothing
-                push!(bytes_arr, parse(UInt8, m.captures[1], base=16))
+                write(output, parse(UInt8, m.captures[1], base=16))
             else
                 for c in s
                     b = get(CHAR_TO_BYTE, c, nothing)
                     if b !== nothing
-                        push!(bytes_arr, b)
+                        write(output, b)
                     else
-                        # Unmapped char (e.g. special unicode tokens) — encode as raw UTF-8
-                        for byte in Vector{UInt8}(string(c))
-                            push!(bytes_arr, byte)
-                        end
+                        write(output, c)
                     end
                 end
             end
         end
     end
-    return String(bytes_arr)
+    return String(take!(output))
 end
 
 function show(io::IO, tok::BPETokenizer)

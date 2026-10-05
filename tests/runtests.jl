@@ -17,6 +17,8 @@ include("unit/test_engine.jl")
 include("unit/test_server_auth.jl")
 include("unit/test_inferno_utils.jl")
 include("unit/core_components.jl")
+include("unit/test_common_ops.jl")
+include("unit/test_generation_edges.jl")
 
 # ===================
 # Diagnostic Tests (require model)

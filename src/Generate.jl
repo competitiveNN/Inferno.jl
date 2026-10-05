@@ -137,7 +137,7 @@ function generate_text(model::ModelCPU.QwenModelCPU, tok::SimpleTokenizer, promp
     repetition_penalty::Float32=1.1f0,
     stop_tokens::Set{Int}=Set{Int}())
     
-    # Add EOS to stop tokens
+    stop_tokens = copy(stop_tokens)
     push!(stop_tokens, tok.eos_id)
     
     # Tokenize prompt
@@ -175,6 +175,7 @@ function generate_text(model::ModelCPU.QwenModelCPU, tok::Tokenizer.BPETokenizer
     stop_tokens::Set{Int}=Set{Int}())
 
     # Add EOS to stop tokens (eos_id is already 1-indexed)
+    stop_tokens = copy(stop_tokens)
     push!(stop_tokens, tok.eos_id)
 
     # Tokenize prompt (returns 1-indexed IDs)
@@ -226,11 +227,9 @@ function generate_text(model::ModelCPU.QwenModelCPU, tok::SimpleTokenizer, promp
     repetition_penalty::Float32=1.1f0,
     stop_tokens::Set{Int}=Set{Int}())
 
+    stop_tokens = copy(stop_tokens)
     push!(stop_tokens, tok.eos_id)
     prompt_tokens = encode(tok, prompt)
-    if isempty(prompt_tokens)
-        return ""
-    end
     return ModelCPU.generate_with_cache(model, tok, prompt, state;
         max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
         repetition_penalty=repetition_penalty, stop_tokens=stop_tokens)
@@ -245,11 +244,9 @@ function generate_text(model::ModelCPU.QwenModelCPU, tok::Tokenizer.BPETokenizer
     repetition_penalty::Float32=1.1f0,
     stop_tokens::Set{Int}=Set{Int}())
 
+    stop_tokens = copy(stop_tokens)
     push!(stop_tokens, tok.eos_id)
     prompt_tokens = encode(tok, prompt)
-    if isempty(prompt_tokens)
-        return ""
-    end
     return ModelCPU.generate_with_cache(model, tok, prompt, state;
         max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
         repetition_penalty=repetition_penalty, stop_tokens=stop_tokens)
@@ -343,10 +340,10 @@ function chat(model::ModelCPU.QwenModelCPU, tok::Tokenizer.BPETokenizer, message
     # Try to find <|im_end|> token
     for (i, t) in enumerate(tok.id_to_token)
         if occursin("<|im_end|>", t)
-            push!(stop_tokens, i - 1)  # Convert 1-indexed to 0-indexed
+            push!(stop_tokens, i)
         end
     end
-    push!(stop_tokens, tok.eos_id - 1)  # Convert 1-indexed to 0-indexed
+    push!(stop_tokens, tok.eos_id)  # BPETokenizer IDs are already 1-indexed
     
     return generate_text(model, tok, prompt;
         max_tokens=max_tokens,

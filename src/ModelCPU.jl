@@ -991,18 +991,21 @@ end
 Persistent generation state with pre-allocated KV caches.
 Avoids ~800MB allocation per generation call by reusing caches.
 
+# Note: this API reuses pre-allocated KV caches and scratch across prompts,
+# not a true sequential continuation (prompt resets tracking/state each call).
 # Example
 ```julia
 state = create_generation_state(model; max_context=8192)
-output = generate_with_cache(model, tokenizer, "Hello", state; max_tokens=50)
-# Continue generation with same state
-more = generate_with_cache(model, tokenizer, "World", state; max_tokens=20)
+output1 = generate_with_cache(model, tok, "Hello", state; max_tokens=20)
+# Reuse the same buffer pool for a new prompt (not append to prior context)
+output2 = generate_with_cache(model, tok, "World", state; max_tokens=20)
 ```
 """
 mutable struct GenerationState
     caches::Vector{KVCacheCPU}
     max_seq::Int
     token_counts::Dict{Int,Int}
+    softmax_scratch::CommonOps.SoftmaxScratch
     last_token::Int
     curr_pos::Int
     tokens_generated::Int
@@ -1010,14 +1013,18 @@ end
 
 function create_generation_state(model::QwenModelCPU; max_context::Int=8192)
     max_cache_seq = min(model.config.max_position_embeddings, max_context)
+    if max_cache_seq <= 0
+        error("max_context must be positive")
+    end
     caches = [init_kv_cache_cpu(model.config, max_cache_seq) for _ in 1:model.config.num_hidden_layers]
     reset_states_cpu!(model)
-    return GenerationState(caches, max_cache_seq, Dict{Int,Int}(), 0, 0, 0)
+    return GenerationState(caches, max_cache_seq, Dict{Int,Int}(),
+        CommonOps.create_softmax_scratch(model.config.vocab_size), 0, 0, 0)
 end
 
 function reset_state!(state::GenerationState, model::QwenModelCPU)
     reset_states_cpu!(model)
-    state.token_counts = Dict{Int,Int}()
+    empty!(state.token_counts)
     state.last_token = 0
     state.curr_pos = 0
     state.tokens_generated = 0
@@ -1183,7 +1190,8 @@ Returns: (next_token, updated_logits)
 """
 function generate_cpu(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU};
     temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0,
-    repetition_penalty::Float32=1.0f0, token_counts::Dict{Int,Int}=Dict{Int,Int}(), presence_penalty::Float32=0.0f0, min_p::Float32=0.0f0)
+    repetition_penalty::Float32=1.0f0, token_counts::Dict{Int,Int}=Dict{Int,Int}(), presence_penalty::Float32=0.0f0, min_p::Float32=0.0f0,
+    softmax_scratch::Union{Nothing,CommonOps.SoftmaxScratch}=nothing)
     
     # Forward pass
     logits = forward_cpu!(model, tokens, pos, caches)
@@ -1196,7 +1204,11 @@ function generate_cpu(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
     apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
     
     # Sample
-    next_token = softmax_sample(logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+    next_token = if softmax_scratch === nothing
+        softmax_sample(logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+    else
+        CommonOps.softmax_sample_scratch!(logits_vec, softmax_scratch; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+    end
     
     return next_token, logits_vec
 end
@@ -1241,101 +1253,120 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
   # Interrupt support
   interrupt_check::Function=() -> false)
  
- return Channel{String}(32) do chan
- try
- # Initialize caches with reasonable max_seq to avoid OOM
- max_cache_seq = min(model.config.max_position_embeddings, max_context)
- caches = [init_kv_cache_cpu(model.config, max_cache_seq) for _ in 1:model.config.num_hidden_layers]
- reset_states_cpu!(model)
- 
- # Track token counts for repetition/presence penalty
- token_counts = Dict{Int,Int}()
- for t in prompt_tokens
- token_counts[t] = get(token_counts, t, 0) + 1
- end
- 
- # Process prompt tokens
- curr_pos = 0
- if !isempty(prompt_tokens)
- # Process all prompt tokens together to properly update states
- # logits has shape (vocab_size, length(prompt_tokens))
- logits = forward_cpu!(model, prompt_tokens, 0, caches)
- curr_pos = length(prompt_tokens)
-
- # The logits for the first generated token are the logits of the last prompt token
- first_logits_vec = vec(logits[:, end])
-
- # Apply penalties to the first token's logits
- apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
- apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
-
- # Sample the first token
- next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
-
- curr_pos += 1
- token_counts[next_token] = get(token_counts, next_token, 0) + 1
-
- # Decode and yield
- token_str = decode_fn([next_token])
- put!(chan, token_str)
-
- last_token = next_token
- 
- # Check if MTP is requested but not supported
- mtp_enabled = use_mtp
- if mtp_enabled
- if model.mtp === nothing
- @warn "MTP requested but model does not have MTP weights. Falling back to sequential generation."
- mtp_enabled = false
- else
- @warn "MTP is experimental. Qwen3.5-0.8B was not trained with MTP mask tokens. Predictions may be incorrect."
- # For now, disable MTP since it produces garbage output
- # TODO: Implement proper MTP when we have a model trained for it
- mtp_enabled = false
- end
- end
- 
- # Generate remaining tokens
- tokens_generated = 1
- while tokens_generated < max_tokens
- # Standard single-token generation (MTP disabled for now)
- next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
- temperature=temperature, top_p=top_p, top_k=top_k, 
- repetition_penalty=repetition_penalty, token_counts=token_counts, 
- presence_penalty=presence_penalty, min_p=min_p)
- 
- # Check stop token BEFORE updating state and yielding
- if next_token in stop_tokens
- break
- end
- 
- curr_pos += 1
- token_counts[next_token] = get(token_counts, next_token, 0) + 1
- 
-token_str = decode_fn([next_token])
-  put!(chan, token_str)
-  
-  last_token = next_token
-  tokens_generated += 1
-
-  if interrupt_check()
-  break
+  if max_tokens < 0
+    error("max_tokens must be non-negative")
   end
+  if max_context <= 0
+    error("max_context must be positive")
   end
+
+  prompt_length = length(prompt_tokens)
+  max_cache_seq = min(model.config.max_position_embeddings, max_context)
+  if max_cache_seq <= 0
+    error("model context length must be positive")
+  end
+  if prompt_length > max_cache_seq
+    error("prompt length $prompt_length exceeds max_context=$max_cache_seq")
+  end
+  if max_tokens > max_cache_seq - prompt_length
+    error("prompt length $prompt_length plus max_tokens=$max_tokens exceeds max_context=$max_cache_seq")
   end
  
-catch e
-  if !(e isa InvalidStateException) && !(e isa InterruptException)
-  @error "ERROR during CPU generation stream" exception=(e, catch_backtrace())
+  return Channel{String}(32) do chan
+  try
+  # Initialize caches with reasonable max_seq to avoid OOM
+  caches = [init_kv_cache_cpu(model.config, max_cache_seq) for _ in 1:model.config.num_hidden_layers]
+  reset_states_cpu!(model)
+ 
+  # Track token counts for repetition/presence penalty
+  token_counts = Dict{Int,Int}()
+  for t in prompt_tokens
+    token_counts[t] = get(token_counts, t, 0) + 1
   end
- finally
- try
- close(chan)
- catch
+ 
+  curr_pos = 0
+  if !isempty(prompt_tokens) && max_tokens > 0
+    # Process all prompt tokens together to properly update states.
+    # logits has shape (vocab_size, length(prompt_tokens)).
+    logits = forward_cpu!(model, prompt_tokens, 0, caches)
+    curr_pos = prompt_length
+
+    # The logits for the first generated token are the logits of the last prompt token.
+    first_logits_vec = vec(logits[:, end])
+
+    # Apply penalties to the first token's logits.
+    apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
+    apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
+
+    # Sample the first token.
+    next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+
+    # A stop token is terminal and must not be counted, decoded, or yielded.
+    if next_token in stop_tokens
+      # No token is emitted.
+    else
+      token_counts[next_token] = get(token_counts, next_token, 0) + 1
+      token_str = decode_fn([next_token])
+      put!(chan, token_str)
+
+      last_token = next_token
+      tokens_generated = 1
+
+      # Check if MTP is requested but not supported.
+      mtp_enabled = use_mtp
+      if mtp_enabled
+        if model.mtp === nothing
+          @warn "MTP requested but model does not have MTP weights. Falling back to sequential generation."
+          mtp_enabled = false
+        else
+          @warn "MTP is experimental. Qwen3.5-0.8B was not trained with MTP mask tokens. Predictions may be incorrect."
+          # For now, disable MTP since it produces garbage output.
+          # TODO: Implement proper MTP when we have a model trained for it.
+          mtp_enabled = false
+        end
+      end
+
+      # Generate remaining tokens. The seed is forwarded at curr_pos before
+      # curr_pos is advanced, so KV/RoPE positions remain zero-based.
+      while tokens_generated < max_tokens
+        next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
+          temperature=temperature, top_p=top_p, top_k=top_k,
+          repetition_penalty=repetition_penalty, token_counts=token_counts,
+          presence_penalty=presence_penalty, min_p=min_p)
+        curr_pos += 1
+
+        # Check stop token before updating counts or yielding.
+        if next_token in stop_tokens
+          break
+        end
+
+        token_counts[next_token] = get(token_counts, next_token, 0) + 1
+        token_str = decode_fn([next_token])
+        put!(chan, token_str)
+
+        last_token = next_token
+        tokens_generated += 1
+
+        if interrupt_check()
+          break
+        end
+      end
+    end
+  end
+ 
+  catch e
+    if !(e isa InvalidStateException) && !(e isa InterruptException)
+      @error "ERROR during CPU generation stream" exception=(e, catch_backtrace())
+    end
+  finally
+    try
+      close(chan)
+    catch
+    end
+  end
+  end
  end
- end
- end
- end
+
 
  """
     generate_with_cache(model, tokenizer, prompt, state::GenerationState; kwargs...)
@@ -1373,13 +1404,10 @@ catch e
     repetition_penalty::Float32=1.1f0,
     stop_tokens::Set{Int}=Set{Int}())
     
+    stop_tokens = copy(stop_tokens)
     push!(stop_tokens, tok.eos_id)
-    
+
     prompt_tokens = getfield(parentmodule(typeof(tok)), :encode)(tok, prompt)
-    if isempty(prompt_tokens)
-        return ""
-    end
-    
     decode_fn = (ids) -> getfield(parentmodule(typeof(tok)), :decode)(tok, ids)
     
     return _generate_from_state(model, prompt_tokens, decode_fn, state;
@@ -1395,49 +1423,68 @@ catch e
     
     caches = state.caches
     token_counts = state.token_counts
-    
-    # Reset state tracking
-    reset_state!(state, model)
-    
-    # Process prompt tokens
-    curr_pos = 0
-    all_tokens = Int[]
-    
-    if !isempty(prompt_tokens)
-        logits = forward_cpu!(model, prompt_tokens, 0, caches)
-        curr_pos = length(prompt_tokens)
-        
-        first_logits_vec = vec(logits[:, end])
-        apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
-        apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
-        
-        next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
-        
-        curr_pos += 1
-        token_counts[next_token] = get(token_counts, next_token, 0) + 1
-        push!(all_tokens, next_token)
-        
-        state.last_token = next_token
-        state.curr_pos = curr_pos
-        state.tokens_generated = 1
-        
-        if next_token in stop_tokens
-            return decode_fn(all_tokens)
-        end
+    softmax_scratch = state.softmax_scratch
+    prompt_length = length(prompt_tokens)
+
+    if state.max_seq <= 0
+        error("GenerationState max_context must be positive")
+    end
+    if prompt_length > state.max_seq
+        error("prompt length $prompt_length exceeds GenerationState max_seq=$(state.max_seq)")
+    end
+    if max_tokens < 0
+        error("max_tokens must be non-negative")
+    end
+    if max_tokens > state.max_seq - prompt_length
+        error("prompt length $prompt_length plus max_tokens=$max_tokens exceeds GenerationState max_seq=$(state.max_seq)")
     end
     
-    # Generate remaining tokens
+    # Reset tracking for every call, including empty prompts and max_tokens=0.
+    reset_state!(state, model)
+
+    # Prompt tokens participate in repetition and presence penalties.
+    for token in prompt_tokens
+        token_counts[token] = get(token_counts, token, 0) + 1
+    end
+
+    all_tokens = Int[]
+    if isempty(prompt_tokens) || max_tokens == 0
+        return decode_fn(all_tokens)
+    end
+    
+    curr_pos = prompt_length
+    logits = forward_cpu!(model, prompt_tokens, 0, caches)
+    first_logits_vec = vec(logits[:, end])
+    apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
+    apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
+    
+    next_token = CommonOps.softmax_sample_scratch!(first_logits_vec, softmax_scratch; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+    
+    # Stop tokens are terminal before they are counted, decoded, or appended.
+    if next_token in stop_tokens
+        return decode_fn(all_tokens)
+    end
+
+    token_counts[next_token] = get(token_counts, next_token, 0) + 1
+    push!(all_tokens, next_token)
+    state.last_token = next_token
+    state.curr_pos = curr_pos
+    state.tokens_generated = 1
+    
+    # Each token returned by generate_cpu has just been cached as the seed at
+    # state.curr_pos; advance only after that forward/cache operation.
     while state.tokens_generated < max_tokens
         next_token, _ = generate_cpu(model, [state.last_token], state.curr_pos, caches;
             temperature=temperature, top_p=top_p, top_k=top_k,
             repetition_penalty=repetition_penalty, token_counts=token_counts,
-            presence_penalty=presence_penalty, min_p=min_p)
+            presence_penalty=presence_penalty, min_p=min_p,
+            softmax_scratch=softmax_scratch)
+        state.curr_pos += 1
         
         if next_token in stop_tokens
             break
         end
         
-        state.curr_pos += 1
         token_counts[next_token] = get(token_counts, next_token, 0) + 1
         state.last_token = next_token
         state.tokens_generated += 1
@@ -1466,13 +1513,6 @@ catch e
  - `top_p`: Nucleus sampling threshold (default: 0.9)
  - `top_k`: Top-k filtering, 0 to disable (default: 40)
  - `repetition_penalty`: Penalty for repeated tokens (default: 1.1)
-
- # Example
- ```julia
- state = create_generation_state(model; max_context=8192)
- prompts = ["Hello", "What is AI?", "Tell me a story"]
- outputs = generate_batch(model, tok, prompts, state; max_tokens=20)
- ```
  """
  function generate_batch(model::QwenModelCPU, tok, prompts::Vector{String}, state::GenerationState;
     max_tokens::Int=256,
@@ -1490,12 +1530,7 @@ catch e
     results = String[]
     for prompt in prompts
         prompt_tokens = encode_fn(prompt)
-        if isempty(prompt_tokens)
-            push!(results, "")
-            continue
-        end
-        # Reset only the tracking state, not the KV cache buffers
-        reset_state!(state, model)
+        # _generate_from_state resets tracking for every prompt, including empty prompts.
         output = _generate_from_state(model, prompt_tokens, decode_fn, state;
             max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
             repetition_penalty=repetition_penalty, stop_tokens=stop_tokens)

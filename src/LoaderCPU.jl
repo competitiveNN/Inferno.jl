@@ -101,7 +101,6 @@ weight_inner_dim(w::Q5_K_Matrix) = w.inner_dim
 weight_inner_dim(w::Q6_K_Matrix) = w.inner_dim
 weight_inner_dim(w::Q8_0_Matrix) = w.inner_dim
 weight_inner_dim(w::IQ4NL_Matrix) = w.inner_dim
-weight_inner_dim(w::Q8_0_Matrix) = w.inner_dim
 
 """
  extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_quantized=false) -> Union{Matrix, QuantizedMatrix}

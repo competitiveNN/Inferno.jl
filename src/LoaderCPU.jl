@@ -92,12 +92,15 @@ weight_outer_dim(w::Q4_K_Matrix) = w.outer_dim
 weight_outer_dim(w::Q5_K_Matrix) = w.outer_dim
 weight_outer_dim(w::Q6_K_Matrix) = w.outer_dim
 weight_outer_dim(w::Q8_0_Matrix) = w.outer_dim
+weight_outer_dim(w::IQ4NL_Matrix) = w.outer_dim
 
 weight_inner_dim(w::Matrix{Float32}) = size(w, 2)
 weight_inner_dim(w::Matrix{BFloat16}) = size(w, 2)
 weight_inner_dim(w::Q4_K_Matrix) = w.inner_dim
 weight_inner_dim(w::Q5_K_Matrix) = w.inner_dim
 weight_inner_dim(w::Q6_K_Matrix) = w.inner_dim
+weight_inner_dim(w::Q8_0_Matrix) = w.inner_dim
+weight_inner_dim(w::IQ4NL_Matrix) = w.inner_dim
 weight_inner_dim(w::Q8_0_Matrix) = w.inner_dim
 
 """
@@ -151,6 +154,11 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_qua
             data_size = num_blocks * QuantsCPU.Q8_0_BLOCK_SIZE
             data = collect(@view file.tensor_data[start:start+data_size-1])
             return Q8_0_Matrix(data, inner, outer)
+        elseif info.type == GGUF.GGML_TYPE_IQ4_NL
+            num_blocks = num_elements ÷ 32
+            data_size = num_blocks * QuantsCPU.IQ4NL_BLOCK_SIZE
+            data = collect(@view file.tensor_data[start:start+data_size-1])
+            return IQ4NL_Matrix(data, inner, outer)
         end
         # Fall through for other types
     end
@@ -178,6 +186,8 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_qua
         Dequant.dequantize_iq3_s(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_IQ4_XS
         Dequant.dequantize_iq4_xs(@view(file.tensor_data[start:end]), num_elements)
+    elseif info.type == GGUF.GGML_TYPE_IQ4_NL
+        Dequant.dequantize_iq4_nl(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q2_K
         Dequant.dequantize_q2_k(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q3_K
@@ -423,28 +433,33 @@ end
 
 function get_config(file::GGUF.GGUFFile)
     arch = get(file.metadata, "general.architecture", "qwen")
-    
+    arch_prefix = arch * "."
+    function md(k::String, default)
+        return get(file.metadata, arch_prefix * k,
+               get(file.metadata, k, default))
+    end
+
     config = ModelCPU.QwenConfigCPU(
         architecture = Symbol(arch),
-        vocab_size = get(file.metadata, "qwen3.vocab_size", get(file.metadata, "vocab_size", 151936)),
-        hidden_size = get(file.metadata, "qwen3.embedding_length", get(file.metadata, "embedding_length", 1024)),
-        intermediate_size = get(file.metadata, "qwen3.feed_forward_length", get(file.metadata, "feed_forward_length", 3584)),
-        num_hidden_layers = get(file.metadata, "qwen3.block_count", get(file.metadata, "block_count", 24)),
-        num_attention_heads = get(file.metadata, "qwen3.attention.head_count", get(file.metadata, "attention.head_count", 8)),
-        num_key_value_heads = get(file.metadata, "qwen3.attention.head_count_kv", get(file.metadata, "attention.head_count_kv", 2)),
-        head_dim = get(file.metadata, "qwen3.attention.key_length", get(file.metadata, "attention.key_length", 256)),
-        rms_norm_eps = Float32(get(file.metadata, "qwen3.attention.layer_norm_rms_epsilon", get(file.metadata, "attention.layer_norm_rms_epsilon", 1e-6))),
-        rope_theta = Float32(get(file.metadata, "qwen3.rope.freq_base", get(file.metadata, "rope.freq_base", 10000000.0))),
-        max_position_embeddings = get(file.metadata, "qwen3.context_length", get(file.metadata, "context_length", 4096)),
-        partial_rotary_factor = Float32(get(file.metadata, "qwen3.rope.partial_rotary_factor", get(file.metadata, "rope.partial_rotary_factor", 0.25))),
-        full_attention_interval = get(file.metadata, "qwen3.full_attention_interval", get(file.metadata, "full_attention_interval", 4)),
-        ssm_inner_size = get(file.metadata, "qwen3.ssm.inner_size", get(file.metadata, "ssm.inner_size", 2048)),
-        ssm_state_size = get(file.metadata, "qwen3.ssm.state_size", get(file.metadata, "ssm.state_size", 128)),
-        ssm_group_count = get(file.metadata, "qwen3.ssm.group_count", get(file.metadata, "ssm.group_count", 16)),
-        ssm_time_step_rank = get(file.metadata, "qwen3.ssm.time_step_rank", get(file.metadata, "ssm.time_step_rank", 16)),
-        ssm_conv_kernel = get(file.metadata, "qwen3.ssm.conv_kernel", get(file.metadata, "ssm.conv_kernel", 4)),
+        vocab_size = md("vocab_size", 151936),
+        hidden_size = md("embedding_length", 1024),
+        intermediate_size = md("feed_forward_length", 3584),
+        num_hidden_layers = md("block_count", 24),
+        num_attention_heads = md("attention.head_count", 8),
+        num_key_value_heads = md("attention.head_count_kv", 2),
+        head_dim = md("attention.key_length", 256),
+        rms_norm_eps = Float32(md("attention.layer_norm_rms_epsilon", 1e-6)),
+        rope_theta = Float32(md("rope.freq_base", 10000000.0)),
+        max_position_embeddings = md("context_length", 4096),
+        partial_rotary_factor = Float32(md("rope.partial_rotary_factor", 0.25)),
+        full_attention_interval = md("full_attention_interval", 4),
+        ssm_inner_size = md("ssm.inner_size", 2048),
+        ssm_state_size = md("ssm.state_size", 128),
+        ssm_group_count = md("ssm.group_count", 16),
+        ssm_time_step_rank = md("ssm.time_step_rank", 16),
+        ssm_conv_kernel = md("ssm.conv_kernel", 4),
     )
-    
+
     return config
 end
 
@@ -490,7 +505,7 @@ function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.Qw
  # For quantized weights, we keep them quantized and handle transpose in multiplication
  
  if keep_quantized && in_proj_info.type in (GGUF.GGML_TYPE_Q4_K, GGUF.GGML_TYPE_Q5_K, 
- GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0)
+ GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0, GGUF.GGML_TYPE_IQ4_NL)
  # Load quantized weights - no transpose needed, handled in multiplication
  in_proj = extract_tensor_cpu(file, in_proj_info; keep_quantized=true)
  gate_proj = extract_tensor_cpu(file, gate_info; keep_quantized=true)
@@ -658,7 +673,7 @@ function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConf
  output_buf = Vector{Float32}(undef, config.hidden_size)
  
  if keep_quantized && gate_info.type in (GGUF.GGML_TYPE_Q4_K, GGUF.GGML_TYPE_Q5_K, 
- GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0)
+ GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0, GGUF.GGML_TYPE_IQ4_NL)
  # Load quantized weights - no transpose, we'll handle it in multiplication
  gate_weight = extract_tensor_cpu(file, gate_info; keep_quantized=true)
  up_weight = extract_tensor_cpu(file, up_info; keep_quantized=true)

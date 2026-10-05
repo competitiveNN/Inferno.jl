@@ -209,7 +209,8 @@ end
 
 function load_model(path::String; device::Union{Int, Nothing}=nothing,
  mmproj::Union{String, Nothing}=nothing,
- backend::Symbol=:auto)
+ backend::Symbol=:auto,
+ keep_quantized::Union{Bool,Nothing}=nothing)
  
  # Detect model format
  fmt = LoaderCPU.detect_model_format(path)
@@ -219,7 +220,7 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing,
  if fmt == :safetensors
  return Safetensors.load_safetensors_model(path)
  else
- return LoaderCPU.load_model_cpu(path)
+ return LoaderCPU.load_model_cpu(path; keep_quantized=keep_quantized)
  end
  end
  

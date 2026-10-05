@@ -15,7 +15,7 @@ module QuantsCPU
 
 using StaticArrays
 
-export Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix
+export Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix, IQ4NL_Matrix
 export dequantize_block!, dequantize_row!
 
 # Block sizes for each quantization type
@@ -23,6 +23,7 @@ const Q4_K_BLOCK_SIZE = 144  # bytes per 256 elements
 const Q5_K_BLOCK_SIZE = 176
 const Q6_K_BLOCK_SIZE = 210  # 208 + 2 for the scale at end
 const Q8_0_BLOCK_SIZE = 34   # 32 elements per block
+const IQ4NL_BLOCK_SIZE = 18  # 2 bytes (d) + 16 bytes (qs) per 32 elements
 
 # ============================================================================
 # Quantized Matrix Wrapper Types
@@ -110,6 +111,30 @@ struct Q8_0_Matrix
         num_blocks = num_elements ÷ 32
         expected_bytes = num_blocks * Q8_0_BLOCK_SIZE
         @assert length(data) >= expected_bytes "Insufficient data for Q8_0 matrix"
+        new(data, inner_dim, outer_dim, num_blocks)
+    end
+end
+
+"""
+    IQ4NL_Matrix
+
+IQ4_NL quantized matrix stored in compressed format.
+Data is stored as raw GGUF bytes (18 bytes per 32 elements), dequantized on-the-fly.
+Block layout per 32 elements: 2 bytes f16 global scale `d`, 16 bytes qs (4-bit nibbles).
+Weight = d * kvalues_iq4nl[nibble], matching llama.cpp `dequantize_row_iq4_nl`.
+"""
+struct IQ4NL_Matrix
+    data::Vector{UInt8}      # Raw quantized data (IQ4_NL blocks, row-major by GGUF dims)
+    inner_dim::Int           # Inner dimension (columns; x vector length)
+    outer_dim::Int           # Outer dimension (rows; output length)
+    num_blocks::Int          # Number of 32-element blocks = inner_dim * outer_dim ÷ 32
+    
+    function IQ4NL_Matrix(data::Vector{UInt8}, inner_dim::Int, outer_dim::Int)
+        num_elements = inner_dim * outer_dim
+        @assert num_elements % 32 == 0 "IQ4_NL requires dimensions divisible by 32"
+        num_blocks = num_elements ÷ 32
+        expected_bytes = num_blocks * IQ4NL_BLOCK_SIZE
+        @assert length(data) >= expected_bytes "Insufficient data for IQ4_NL matrix"
         new(data, inner_dim, outer_dim, num_blocks)
     end
 end

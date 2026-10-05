@@ -3,7 +3,7 @@ module Dequant
 using ..QuantsData
 
 export dequantize_iq2_xxs, dequantize_iq2_xs, dequantize_iq2_s, dequantize_iq3_xxs, dequantize_iq3_s,
-       dequantize_iq4_xs, dequantize_q2_k, dequantize_q3_k, dequantize_q4_k, dequantize_q5_k, dequantize_q6_k, dequantize_q8_0
+       dequantize_iq4_xs, dequantize_iq4_nl, dequantize_q2_k, dequantize_q3_k, dequantize_q4_k, dequantize_q5_k, dequantize_q6_k, dequantize_q8_0
 
 # --- Dequantization Logic ---
 
@@ -637,6 +637,58 @@ function dequantize_iq4_xs(data::AbstractVector{UInt8}, num_elements::Int)
         end
     end
     return weights
+end
+
+"""
+    dequantize_iq4_nl(data, num_elements) -> Vector{Float32}
+
+Dequantize IQ4_NL quantized weights.
+
+Block layout (block_iq4_nl, QK4_NL == 32):
+  d     : ggml_bfloat16 / f16  (2 bytes)
+  qs[16]: uint8_t              (16 bytes, packed 4-bit nibbles)
+  Total = 18 bytes per block of 32 elements.
+
+Each block uses a single global scale d; each weight = d * KVALUES_IQ4NL[nibble].
+Matches llama.cpp `dequantize_row_iq4_nl`.
+
+Reference: llama.cpp ggml-quants.c + gguf-py gguf/quants.py (IQ4_NL.kvalues).
+"""
+function dequantize_iq4_nl(data::AbstractVector{UInt8}, num_elements::Int)
+    @assert num_elements % 32 == 0
+    nb = num_elements ÷ 32
+    block_size = 18  # 2 (d) + 16 (qs)
+    weights = Vector{Float32}(undef, num_elements)
+
+    for i in 0:(nb - 1)
+        offset = i * block_size + 1
+        d = Float32(reinterpret(Float16, data[offset:(offset + 1)])[1])
+        qs = @view data[offset + 2:(offset + 17)]
+        idx_base = i * 32 + 1
+
+        for j in 0:15
+            weights[idx_base + j]     = d * Float32(KVALUES_IQ4NL[(qs[j + 1] & 0x0f) + 1])
+            weights[idx_base + j + 16] = d * Float32(KVALUES_IQ4NL[(qs[j + 1] >> 4) + 1])
+        end
+    end
+    return weights
+end
+
+"""
+    dequantize_iq4_nl_into!(out, data, block_offset)
+
+In-place dequantization of one IQ4_NL block into `out` (32 elements),
+matching llama.cpp `dequantize_row_iq4_nl` element order.
+"""
+function dequantize_iq4_nl_into!(out::Vector{Float32}, data::AbstractVector{UInt8}, block_offset::Int)
+    @assert length(out) == 32
+    d = Float32(reinterpret(Float16, data[block_offset:block_offset + 1])[1])
+    qs = @view data[block_offset + 2:block_offset + 17]
+    @inbounds for j in 0:15
+        out[j + 1]     = d * Float32(KVALUES_IQ4NL[(qs[j + 1] & 0x0f) + 1])
+        out[j + 17]    = d * Float32(KVALUES_IQ4NL[(qs[j + 1] >> 4) + 1])
+    end
+    return out
 end
 
 end # module

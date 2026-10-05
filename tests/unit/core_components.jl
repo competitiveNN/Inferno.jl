@@ -173,6 +173,36 @@ end
         y = dequantize_iq3_xxs(data, 256)
         @test all(y .== Float16(0.0))
     end
+
+    @testset "IQ4_NL" begin
+        # block_iq4_nl: 2 bytes f16 scale d, 16 bytes qs (4-bit nibbles), 32 elements/block.
+        # Reference: llama.cpp dequantize_row_iq4_nl / gguf-py IQ4_NL.kvalues
+        # = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+        # d = 1.0f16, all nibbles 0 -> every weight = 1.0 * -127 = -127
+        data = zeros(UInt8, 18); data[1] = 0x00; data[2] = 0x3c  # f16 1.0
+        y = dequantize_iq4_nl(data, 32)
+        @test all(y .== Float32(-127.0))
+        # nibble 1 -> -104 ; nibble 8 -> 1 ; nibble 15 -> 113
+        data = zeros(UInt8, 18); data[1] = 0x00; data[2] = 0x3c
+        data[3] = 0x18  # first qs byte: low nibble 8 -> 1,  high nibble 1 -> -104
+        y = dequantize_iq4_nl(data, 32)
+        @test y[1]  == Float32(1.0)     # qs[0] low nibble 8  -> kvalues[9]  = 1
+        @test y[17] == Float32(-104.0)  # qs[0] high nibble 1 -> kvalues[2]  = -104
+        @test y[16] == Float32(-127.0)  # qs[1] low nibble 0  -> kvalues[1]  = -127
+        @test y[32] == Float32(-127.0)  # qs[1] high nibble 0 -> kvalues[1]  = -127
+        # d = 2.0f16 scales everything
+        data = zeros(UInt8, 18); data[1] = 0x00; data[2] = 0x40  # f16 2.0
+        data[3] = 0x18
+        y = dequantize_iq4_nl(data, 32)
+        @test y[1]  == Float32(2.0)
+        @test y[17] == Float32(-208.0)
+        # full nibble range in first byte: 0xEB -> low=0xB(38), high=0xE(89)
+        data = zeros(UInt8, 18); data[1] = 0x00; data[2] = 0x3c
+        data[3] = 0b1110_1011
+        y = dequantize_iq4_nl(data, 32)
+        @test y[1]  == Float32(38.0)
+        @test y[17] == Float32(89.0)
+    end
 end
 
 @testset "Quant tables (llama.cpp ggml-common.h reference)" begin

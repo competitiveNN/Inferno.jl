@@ -260,7 +260,7 @@ end
 
 # --- MLP ---
 # Union type for weight matrices (Float32, Quantized, or BFloat16 with Arrow Lake support)
-const QuantOrFloat32 = Union{Matrix{Float32}, Matrix{BFloat16}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
+const QuantOrFloat32 = Union{Matrix{Float32}, Matrix{BFloat16}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix, IQ4NL_Matrix}
 
 struct MLPCPU
  gate_weight::QuantOrFloat32 # (intermediate, hidden) after GGUF reshape+transpose
@@ -378,6 +378,35 @@ function mul_quant_mat_vec(mat::Q8_0_Matrix, x::Vector{Float32}, out::Vector{Flo
     return out
 end
 
+function mul_quant_mat_vec(mat::IQ4NL_Matrix, x::Vector{Float32}, out::Vector{Float32})
+    # IQ4_NL: 18 bytes per 32 elements, row-major blocks (GGUF dims order).
+    # For each output row `row`, dequantize the inner_dim/32 blocks in that row
+    # and accumulate the dot product with x.
+    fill!(out, 0.0f0)
+    block_values = zeros(Float32, 32)
+    
+    blocks_per_row = mat.inner_dim ÷ 32
+    for row in 1:mat.outer_dim
+        sum_val = 0.0f0
+        row_start_block = (row - 1) * blocks_per_row
+        
+        for block in 0:(blocks_per_row - 1)
+            global_block_idx = row_start_block + block
+            block_offset = global_block_idx * IQ4NL_BLOCK_SIZE + 1
+            
+            # Dequantize this block (in-place into block_values, matching llama.cpp order)
+            dequantize_iq4_nl_into!(block_values, mat.data, block_offset)
+            
+            for i in 1:32
+                col_idx = block * 32 + i
+                sum_val += block_values[i] * x[col_idx]
+            end
+        end
+        out[row] = sum_val
+    end
+    return out
+end
+
 # Generic multiplication for quantized or Float32 weights
 function mlp_mat_vec_mul(weight::Matrix{Float32}, x::Vector{Float32})
     return weight * x
@@ -399,6 +428,11 @@ function mlp_mat_vec_mul(weight::Q6_K_Matrix, x::Vector{Float32})
 end
 
 function mlp_mat_vec_mul(weight::Q8_0_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+function mlp_mat_vec_mul(weight::IQ4NL_Matrix, x::Vector{Float32})
  out = Vector{Float32}(undef, weight.outer_dim)
  return mul_quant_mat_vec(weight, x, out)
 end

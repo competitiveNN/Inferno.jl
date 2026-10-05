@@ -161,6 +161,11 @@ end
         data = zeros(UInt8, 74); data[1] = 0x00; data[2] = 0x3c
         y = dequantize_iq2_xs(data, 256)
         @test all(y .== Float16(0.0))
+        # qs[0] = 1 -> grid entry 2 = 0x080808080808082b: byte0 = 0x2b-8 = 35, rest 0
+        data[3] = 0x01
+        y = dequantize_iq2_xs(data, 256)
+        @test y[1] == Float16(4.375) # 35 * 0.125
+        @test all(y[2:8] .== Float16(0.0))
     end
 
     @testset "IQ3_XXS" begin
@@ -168,6 +173,36 @@ end
         y = dequantize_iq3_xxs(data, 256)
         @test all(y .== Float16(0.0))
     end
+end
+
+@testset "Quant tables (llama.cpp ggml-common.h reference)" begin
+    using Inferno.QuantsData
+
+    # Grid tables: exact reference lengths, sorted, unique.
+    # IQ2XS_GRID was once corrupted (790 entries, unsorted) — regression guard.
+    @test length(QuantsData.IQ2XXS_GRID) == 256
+    @test length(QuantsData.IQ2XS_GRID)  == 512
+    @test length(QuantsData.IQ2S_GRID)   == 1024
+    @test length(QuantsData.IQ3XXS_GRID) == 256
+    @test length(QuantsData.IQ3S_GRID)   == 512
+    for g in (QuantsData.IQ2XXS_GRID, QuantsData.IQ2XS_GRID, QuantsData.IQ2S_GRID,
+              QuantsData.IQ3XXS_GRID, QuantsData.IQ3S_GRID)
+        @test g == sort(g)
+        @test length(unique(g)) == length(g)
+    end
+    @test QuantsData.IQ2XS_GRID[1]   == 0x0808080808080808
+    @test QuantsData.IQ2XS_GRID[2]   == 0x080808080808082b
+    @test QuantsData.IQ2XS_GRID[end] == 0x2b2b2b2b2b2b2b2b
+    @test QuantsData.IQ2XXS_GRID[1]  == 0x0808080808080808
+    @test QuantsData.IQ3S_GRID[1]    == 0x01010101
+    @test QuantsData.IQ3XXS_GRID[1]  == 0x04040404
+
+    @test length(QuantsData.KSIGNS_IQ2XS) == 128
+    @test length(QuantsData.KMASK_IQ2XS)  == 8
+    @test QuantsData.KMASK_IQ2XS == UInt8[1, 2, 4, 8, 16, 32, 64, 128]
+    @test length(QuantsData.KVALUES_IQ4NL) == 16
+    @test QuantsData.KVALUES_IQ4NL[1] == -127
+    @test QuantsData.KVALUES_IQ4NL[end] == 113
 end
 
 

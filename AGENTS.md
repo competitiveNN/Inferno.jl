@@ -170,6 +170,7 @@ grep -rhoE 'ENV\["[A-Za-z0-9_]+"' src/ tests/ bin/ examples/ | sort -u
 | `INFERNO_SAFETENSORS_MODEL` | safetensors dir for the pipeline diagnostic |
 | `INFERNO_API_KEY` | HTTP server auth token (`Server.jl`) |
 | `INFERNO_NO_QUANT_KERNELS` | disables the native C SIMD quant kernels (`src/QuantizedKernels.jl:28`; any value != `"0"` disables) |
+| `INFERNO_KEEP_QUANTIZED` | opt-in to keeping weights quantized in-memory (memory savings; off by default — BLAS F32 is faster; set to `"1"` to enable, e.g. `INFERNO_KEEP_QUANTIZED=1`) |
 | `OMP_NUM_THREADS` | BLAS/thread-pool sizing (8 measured optimal) |
 | `RUN_PYTHON_COMPARISON` | enables Julia-vs-Python comparison tests |
 

@@ -236,7 +236,7 @@ and loads the appropriate backend.
 
 # Arguments
 - `path::String`: Path to GGUF file, safetensors file, or directory containing model
-- `keep_quantized`: If true, preserve quantized weights for memory efficiency. If nothing (default), auto-detect based on C kernel availability.
+- `keep_quantized`: If true, preserve quantized weights for memory efficiency (default off — BLAS is faster; enable via env var `INFERNO_KEEP_QUANTIZED=1` or pass explicitly).
 
 # Returns
 - `model::QwenModelCPU`: The loaded CPU model
@@ -252,6 +252,10 @@ model, tok = load_model_cpu("path/to/model_dir")
 
 # Keep quantized weights for Q4_K models
 model, tok = load_model_cpu("model.gguf"; keep_quantized=true)
+
+# Same via environment variable (recommended for large models)
+ENV["INFERNO_KEEP_QUANTIZED"] = "1"
+model, tok = load_model_cpu("model.gguf")
 ```
 
 # Supported Formats
@@ -369,14 +373,16 @@ end
  @info "BF16 weight conversion enabled for Arrow Lake - 50% memory reduction on weights"
  end
  
- # Auto-detect keep_quantized: default to F32 BLAS unless memory-constrained
- # C kernels are slower than BLAS for most matrix sizes on this model
+ # Auto-detect keep_quantized: disabled by default (BLAS is faster for this model size);
+ # opt in via env var INFERNO_KEEP_QUANTIZED=1 or keep_quantized=true.
  if keep_quantized === nothing
- keep_quantized = false
- if QuantizedKernels.quant_kernels_available()
- println("Dequantizing to F32 (BLAS is faster for this model size — use keep_quantized=true for memory savings)")
+ keep_quantized = get(ENV, "INFERNO_KEEP_QUANTIZED", "0") != "0"
+ if keep_quantized
+ @info "INFERNO_KEEP_QUANTIZED=1: preserving quantized weights (memory savings; may be slower)"
+ elseif QuantizedKernels.quant_kernels_available()
+ @info "Dequantizing to F32 (BLAS is faster for this model size — set INFERNO_KEEP_QUANTIZED=1 to preserve quantized weights)"
  else
- println("Dequantizing to F32 (C kernels not available)")
+ @info "Dequantizing to F32 (C quant kernels not available)"
  end
  end
  

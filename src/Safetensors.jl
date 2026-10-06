@@ -116,25 +116,29 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
  end
  elseif dtype == 3 # BF16
  bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
- # BF16 is stored as 16-bit values, need to convert to Float32
- # BF16 has same exponent format as F32, just truncated mantissa
- # To convert: reinterpret as UInt16, shift left 16 bits, reinterpret as Float32
- data_bf16 = reinterpret(UInt16, bytes)
- # Each BF16 value needs to become a Float32
- data_f32 = [reinterpret(Float32, UInt32(x) << 16) for x in data_bf16]
+ # BF16 is stored as 16-bit values. Convert to Float32 by moving the
+ # 16-bit bit pattern into the upper 16 bits of a 32-bit Float32
+ # representation (truncating the mantissa, like HF's conversion).
+ # Preallocate the output vector up front (matching the F32 path) to keep
+ # allocations minimal: 1 alloc + the copy(reshape) below.
+ data_u16 = reinterpret(UInt16, bytes)
+ data = Vector{Float32}(undef, num_elements)
+ @inbounds @simd for i in eachindex(data)
+   data[i] = reinterpret(Float32, UInt32(data_u16[i]) << 16)
+ end
  # Safetensors stores data in row-major order, but Julia uses column-major.
  # We need to reshape and then transpose to get correct ordering.
  # For a 2D tensor with shape [rows, cols], the data is stored row-by-row.
  # In Julia, reshape(data, cols, rows)' gives the correct matrix.
  if length(shape) == 2
- return copy(reshape(data_f32, shape[2], shape[1])')
+ return copy(reshape(data, shape[2], shape[1])')
  elseif length(shape) == 3 && shape[2] == 1
  # 3D tensor with shape [C, 1, K] (like conv1d)
  # Safetensors stores as [C, K] in row-major
  # Need: reshape to (K, C) then transpose to (C, K)
- return copy(reshape(data_f32, shape[3], shape[1])')
+ return copy(reshape(data, shape[3], shape[1])')
  else
- return copy(reshape(data_f32, shape...))
+ return copy(reshape(data, shape...))
  end
  else
  error("Unsupported dtype: $dtype")
@@ -209,7 +213,47 @@ function load_safetensors_model(model_path::String)
  # Load safetensors file
  println("Loading safetensors from: $safetensors_path")
  sf = parse_safetensors(safetensors_path)
-    
+  
+ # Derive ssm_inner_size from the true out_proj shape.
+ # The HF config.json does not carry the SSM inner dimension; its `intermediate_size`
+ # (3584 for Qwen3.5-0.8B) is NOT the SSM inner size (2048). The linear_attn.out_proj
+ # weight is (hidden, d_inner), so its second dimension gives the true ssm_inner_size.
+ # QwenConfigCPU is immutable, so we rebuild it with the corrected value.
+ ssm_out_name = nothing
+ for name in keys(sf.tensors)
+     if occursin("linear_attn.out_proj.weight", name)
+         ssm_out_name = name
+         break
+     end
+ end
+ if ssm_out_name !== nothing
+     _, _, ssm_out_shape = sf.tensors[ssm_out_name]
+     ssm_d_inner = ssm_out_shape[2]
+     model_config = ModelCPU.QwenConfigCPU(
+         architecture = :qwen35,
+         vocab_size = model_config.vocab_size,
+         hidden_size = model_config.hidden_size,
+         intermediate_size = model_config.intermediate_size,
+         num_hidden_layers = model_config.num_hidden_layers,
+         num_attention_heads = model_config.num_attention_heads,
+         num_key_value_heads = model_config.num_key_value_heads,
+         head_dim = model_config.head_dim,
+         rms_norm_eps = model_config.rms_norm_eps,
+         rope_theta = model_config.rope_theta,
+         max_position_embeddings = model_config.max_position_embeddings,
+         partial_rotary_factor = model_config.partial_rotary_factor,
+         full_attention_interval = model_config.full_attention_interval,
+         ssm_inner_size = ssm_d_inner,
+         ssm_state_size = model_config.ssm_state_size,
+         ssm_group_count = model_config.ssm_group_count,
+         ssm_time_step_rank = model_config.ssm_time_step_rank,
+         ssm_conv_kernel = model_config.ssm_conv_kernel,
+     )
+     @info "Safetensors Qwen3.5: derived ssm_inner_size=$ssm_d_inner from $ssm_out_name $ssm_out_shape"
+ else
+     @warn "Could not derive ssm_inner_size from tensor metadata; using config default $(model_config.ssm_inner_size)"
+ end
+     
     # Print tensor names for debugging
     println("\nAvailable tensor names (first 20):")
     for (i, name) in enumerate(keys(sf.tensors))

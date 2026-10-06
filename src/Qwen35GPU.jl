@@ -13,6 +13,7 @@ using oneAPI
 using oneAPI: oneAPIBackend
 using LinearAlgebra
 using KernelAbstractions
+using Printf
 
 # GPU backend for KA kernel calls
 const _GPU_BACKEND = oneAPIBackend()
@@ -33,6 +34,13 @@ const oneMatrix{T} = oneArray{T,2}
 # GPU Precision — use Float16 for 2x throughput on Intel Arc
 # ============================================================
 const E = Float32  # diagnostic: FP32 to isolate precision vs algorithmic divergence
+
+# ============================================================
+# Public API
+# ============================================================
+export Qwen35GPUConfig
+export Qwen35GPUModel, AttentionLayer, SSMLayer, MLPLayer, DecoderLayer
+export load_qwen35_gpu, generate_stream, forward_gpu!, reset_model!
 
 # ============================================================
 # Config
@@ -130,18 +138,18 @@ mutable struct Qwen35GPUModel
     attn_out::oneVector{E}
     gate_buf::oneVector{E}
     gate_stack::oneVector{E}          # attention sigmoid gate
-    q_norm_buf::oneVector{<:AbstractFloat}   # per-head q norm (num_v_heads * head_k_dim)
-    k_norm_buf::oneVector{<:AbstractFloat}   # per-head k norm (num_v_heads * head_k_dim)
-    decay_buf::oneVector{<:AbstractFloat}    # delta-net decay (num_v_heads)
-    beta_gate_buf::oneVector{<:AbstractFloat} # delta-net beta gate (num_v_heads)
+    q_norm_buf::oneVector{Float32}   # per-head q norm (num_v_heads * head_k_dim)
+    k_norm_buf::oneVector{Float32}   # per-head k norm (num_v_heads * head_k_dim)
+    decay_buf::oneVector{Float32}    # delta-net decay (num_v_heads)
+    beta_gate_buf::oneVector{Float32} # delta-net beta gate (num_v_heads)
     up_buf::oneVector{E}
     out_buf::oneVector{E}
-    ssm_out_buf::oneVector{<:AbstractFloat}  # delta-net y_all accumulation (Float32)
+    ssm_out_buf::oneVector{Float32}  # delta-net y_all accumulation (Float32)
     score_buf::oneMatrix{E}
     q_buf::oneVector{E}
     k_buf::oneVector{E}
     v_buf::oneVector{E}
-    xz_buf::oneVector{<:AbstractFloat}       # in_proj raw + silu conv output (q/k/v source, Float32 for delta-net accuracy)
+    xz_buf::oneVector{Float32}       # in_proj raw + silu conv output (q/k/v source, Float32 for delta-net accuracy)
     gate_ssm_buf::oneVector{E}
     alpha_buf::oneVector{E}
     beta_buf::oneVector{E}
@@ -537,6 +545,7 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
     head_dim = cfg.head_dim
 
     function gpu_tensor(name::String)
+        @printf "[GPU] loading %s\n" name
         info = GGUF.get_tensor(file, name)
         cpu_tensor = LoaderCPU.extract_tensor_cpu(file, info)
         # Convert all CPU weights to GPU Float16, transposing matrices to matmul
@@ -722,16 +731,16 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
         up_buf = oneVector{E}(undef, cfg.intermediate_size),
         out_buf = oneVector{E}(undef, h),
         gate_stack = oneVector{E}(undef, head_dim * cfg.num_attention_heads),
-        q_norm_buf = oneVector{<:AbstractFloat}(undef, num_v_heads * head_k_dim),
-        k_norm_buf = oneVector{<:AbstractFloat}(undef, num_v_heads * head_k_dim),
-        decay_buf = oneVector{<:AbstractFloat}(undef, num_v_heads),
-        beta_gate_buf = oneVector{<:AbstractFloat}(undef, num_v_heads),
-        ssm_out_buf = oneVector{<:AbstractFloat}(undef, d_inner),
+        q_norm_buf = oneVector{Float32}(undef, num_v_heads * head_k_dim),
+        k_norm_buf = oneVector{Float32}(undef, num_v_heads * head_k_dim),
+        decay_buf = oneVector{Float32}(undef, num_v_heads),
+        beta_gate_buf = oneVector{Float32}(undef, num_v_heads),
+        ssm_out_buf = oneVector{Float32}(undef, d_inner),
         score_buf = oneMatrix{E}(undef, 1, 1),
         q_buf = oneVector{E}(undef, head_dim * cfg.num_attention_heads),
         k_buf = oneVector{E}(undef, head_dim * cfg.num_key_value_heads),
         v_buf = oneVector{E}(undef, head_dim * cfg.num_key_value_heads),
-        xz_buf = oneVector{<:AbstractFloat}(undef, conv_channels),
+        xz_buf = oneVector{Float32}(undef, conv_channels),
         gate_ssm_buf = oneVector{E}(undef, d_inner),
         alpha_buf = oneVector{E}(undef, num_v_heads),
         beta_buf = oneVector{E}(undef, num_v_heads),

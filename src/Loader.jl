@@ -48,6 +48,8 @@ function extract_tensor(file::GGUF.GGUFFile, info::GGUF.TensorInfo)
         dequantize_iq3_s(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_IQ4_XS
         dequantize_iq4_xs(@view(file.tensor_data[start:end]), num_elements)
+    elseif info.type == GGUF.GGML_TYPE_IQ4_NL
+        dequantize_iq4_nl(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q2_K
         dequantize_q2_k(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q3_K

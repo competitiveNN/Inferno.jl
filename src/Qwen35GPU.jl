@@ -612,19 +612,28 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
             ssm_dt_bias = gpu_tensor("$(prefix)ssm_dt_bias.weight")
             ssm_norm_w = gpu_tensor("$(prefix)ssm_norm.weight")
             
-            # Determine SSM dimensions
-            d_inner = size(ssm_out, 2)  # output dimension
-            conv_channels = size(ssm_conv1d, 2)
-            num_v_heads = 1  # placeholder, will be inferred from actual tensor shapes
+            # Determine SSM dimensions from tensor shapes (matches CPU load_ssm_layer)
+            #   ssm_a: (num_v_heads,) ; gate_proj: (d_inner, hidden); in_proj: (conv_channels, hidden)
+            num_v_heads = length(ssm_a)
+            num_k_heads = num_v_heads          # same for Qwen3.5
+            d_inner = size(gate_proj, 1)       # gate_proj output dim
+            head_v_dim = d_inner ÷ num_v_heads
+            conv_channels = size(in_proj, 1)   # in_proj output dim
+            conv_kernel = size(ssm_conv1d, 2)
+            head_k_dim = (conv_channels - d_inner) ÷ (2 * num_k_heads)
+            
+            # Conv1d: raw GGUF layout is (K, C) = (4, 6144); kernel access conv1d[c,k] needs (C, K)
+            ssm_conv1d = oneArray(Matrix{Float32}(Array(ssm_conv1d))')
             
             # State buffers (Float32 for precision)
-            conv_state = oneArray(zeros(Float32, conv_channels, cfg.ssm_conv_kernel))
-            h_state = oneArray(zeros(Float32, 1, 1, num_v_heads))
+            conv_state = oneArray(zeros(Float32, conv_channels, conv_kernel))
+            h_state = oneArray(zeros(Float32, head_v_dim, head_k_dim, num_v_heads))
             
             ssm_layer = SSMLayer(in_proj, gate_proj, ssm_out, ssm_conv1d, alpha_w, beta_w,
                                 ssm_a, ssm_dt_bias, ssm_norm_w,
                                 conv_state, h_state,
-                                d_inner, num_v_heads, 1, 1, 1, conv_channels)
+                                d_inner, num_v_heads, num_k_heads, head_v_dim, head_k_dim,
+                                conv_channels, conv_kernel)
             
             ssm = ssm_layer
         else
@@ -634,6 +643,21 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
         layer = DecoderLayer(input_norm, attn_layer, mlp_layer, ssm, post_norm, is_attention)
         push!(layers, layer)
     end
+
+    # Compute SSM work-buffer sizes from the first SSM layer (all SSM layers share dims)
+    ssm = nothing
+    for l in layers
+        if !isnothing(l.ssm)
+            ssm = l.ssm
+            break
+        end
+    end
+    num_v_heads = ssm.num_v_heads
+    head_k_dim = ssm.head_k_dim
+    head_v_dim = ssm.head_v_dim
+    d_inner = ssm.d_inner
+    conv_channels = ssm.conv_channels
+    num_k_heads = ssm.num_k_heads
 
     # RoPE tables (keep in Float32 for accuracy)
     function precompute_rope(dim::Int, max_seq_len::Int, theta::Float32)
@@ -683,15 +707,20 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
         gate_buf = oneVector{E}(undef, cfg.intermediate_size),
         up_buf = oneVector{E}(undef, cfg.intermediate_size),
         out_buf = oneVector{E}(undef, h),
-        ssm_out_buf = oneVector{E}(undef, cfg.ssm_inner_size),
+        gate_stack = oneVector{E}(undef, head_dim * cfg.num_attention_heads),
+        q_norm_buf = oneVector{<:AbstractFloat}(undef, num_v_heads * head_k_dim),
+        k_norm_buf = oneVector{<:AbstractFloat}(undef, num_v_heads * head_k_dim),
+        decay_buf = oneVector{<:AbstractFloat}(undef, num_v_heads),
+        beta_gate_buf = oneVector{<:AbstractFloat}(undef, num_v_heads),
+        ssm_out_buf = oneVector{<:AbstractFloat}(undef, d_inner),
         score_buf = oneMatrix{E}(undef, 1, 1),
         q_buf = oneVector{E}(undef, head_dim * cfg.num_attention_heads),
         k_buf = oneVector{E}(undef, head_dim * cfg.num_key_value_heads),
         v_buf = oneVector{E}(undef, head_dim * cfg.num_key_value_heads),
-        xz_buf = oneVector{E}(undef, cfg.ssm_inner_size + cfg.hidden_size),
-        gate_ssm_buf = oneVector{E}(undef, cfg.ssm_inner_size),
-        alpha_buf = oneVector{E}(undef, cfg.ssm_group_count),
-        beta_buf = oneVector{E}(undef, cfg.ssm_group_count),
+        xz_buf = oneVector{<:AbstractFloat}(undef, conv_channels),
+        gate_ssm_buf = oneVector{E}(undef, d_inner),
+        alpha_buf = oneVector{E}(undef, num_v_heads),
+        beta_buf = oneVector{E}(undef, num_v_heads),
         logits_buf = oneVector{E}(undef, cfg.vocab_size),
         # Batched work buffers
         qkv_stack = oneVector{E}(undef, head_dim * cfg.num_attention_heads + 2 * head_dim * cfg.num_key_value_heads),

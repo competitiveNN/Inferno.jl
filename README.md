@@ -1,5 +1,7 @@
 # Inferno.jl
 
+**Status: PAUSED INDEFINITELY.** Development is currently halted due to an unresolved error with the oneAPI/LevelZero GPU stack that cannot be diagnosed from this tree. See the AGENTS.md doc for the GPU backend status.
+
 Julia native inference engine for GGUF models with Intel GPU (oneAPI) support.
 
 ## Features
@@ -91,7 +93,7 @@ The model expects GGUF format with:
 - [x] Rotary Position Embeddings (partial rotary)
 - [x] SSM/Mamba layer
 - [x] Full Attention layer with Q/K norm and gating
-- [ ] GPU kernel optimization
+- [ ] GPU kernel optimization — **paused indefinitely** (unresolved oneAPI/LevelZero error; see note above)
 - [ ] Proper tokenizer (BPE)
 - [ ] Sampling strategies (temperature, top-p, top-k)
 - [ ] Batched inference

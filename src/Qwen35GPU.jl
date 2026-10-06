@@ -583,8 +583,9 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
             
             q_norm = gpu_tensor("$(prefix)attn_q_norm.weight")
             k_norm = gpu_tensor("$(prefix)attn_k_norm.weight")
+            attn_gate = gpu_tensor("$(prefix)attn_gate.weight")
             
-            attn_layer = AttentionLayer(qkv_w, q_w, k_w, v_w, o_w, q_norm, k_norm)
+            attn_layer = AttentionLayer(qkv_w, q_w, k_w, v_w, o_w, q_norm, k_norm, attn_gate)
         else
             attn_layer = nothing
         end

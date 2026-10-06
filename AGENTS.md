@@ -186,7 +186,12 @@ because the Julia port has almost no runtime knobs.
   `set_inference_precision!`) but stays off by default.
 * **Full GPU forward** — blocked at the driver layer (see READ FIRST). Element-wise
   KA kernels are correct; the matmul precision divergence and the NEO/driver
-  versions are the wall. Revisit only when a newer `NEO_jll` or a fixed
+  versions are the wall. **All reduction kernels (rmsnorm/qk_norm/ssm y-norm/attention
+  softmax/reduce_sum/argmax/temperature_softmax/sampling) have been re-implemented as
+  chunked multi-pass passes (per-thread loops ≤ 32, host reduction) to avoid the
+  oneAPI JIT miscompilation for loops ≥ ~58; see `GPUCommon.jl`, `FusedKernels.jl`.
+  These are source-verified but cannot be executed until the driver issue is
+  resolved.** Revisit only when a newer `NEO_jll` or a fixed
   system runtime ships.
 * **Gemma4 full-FP32 on GPU** — OOM; the Q4_K-packed streaming structure
   (~289 MB, `Gemma4GPU.jl`) is the working shape, but the "COMPLETE" GPU docs in

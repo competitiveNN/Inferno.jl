@@ -56,7 +56,7 @@ Base.@kwdef struct Qwen3ConfigCPU
     num_attention_heads::Int = 32
     num_key_value_heads::Int = 8
     head_dim::Int = 128
-    rms_norm_eps::Float32 = 1e-6f0
+    rms_norm_eps::Float32 = 1.0f-6
     rope_theta::Float32 = 1000000.0f0
     max_position_embeddings::Int = 32768
     # Performance options
@@ -241,7 +241,7 @@ function mul!(out::Vector{Float32}, weight::QuantOrFloat32, x::Vector{Float32})
 end
 
 # --- L2 Normalization ---
-function l2norm!(x::AbstractArray{Float32}; eps::Float32 = 1e-6f0)
+function l2norm!(x::AbstractArray{Float32}; eps::Float32 = 1.0f-6)
     norm_val = sqrt(sum(abs2, x) + eps)
     @. x = x / norm_val
     return x

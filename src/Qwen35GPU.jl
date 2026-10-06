@@ -18,8 +18,8 @@ using KernelAbstractions
 const _GPU_BACKEND = oneAPIBackend()
 
 # Use unified kernel library
-using ..GPUCommon: rmsnorm_gpu!, silu_gpu!, sigmoid_gpu!, batched_attention_scores!, batched_softmax!, batched_ssm_state_update!, batched_ssm_output_sum!, write_kv_cache_gpu!, fused_attention_forward!
-using ..FusedKernels: fused_l2norm!, fused_attention_weighted_sum!, fused_mlp_gate_mul!, fused_silu_gate_mul!, fused_ssm_gate_sigmoid!, fused_ssm_decay!, gpu_argmax!, gpu_sample!
+using ..GPUCommon: rmsnorm_gpu!, silu_gpu!, sigmoid_gpu!, batched_attention_scores!, batched_softmax!, write_kv_cache_gpu!, fused_attention_forward!, rmsnorm_headed_gpu!, ssm_conv_kernel!, ssm_qk_norm_kernel!, ssm_state_kernel!, ssm_y_norm_kernel!
+using ..FusedKernels: fused_l2norm!, fused_attention_weighted_sum!, fused_mlp_gate_mul!, fused_silu_gate_mul!, fused_ssm_gate_sigmoid!, fused_ssm_decay!, gpu_argmax!, gpu_sample!, elementwise_mul!
 
 using ..GGUF
 using ..Tokenizer
@@ -32,7 +32,7 @@ const oneMatrix{T} = oneArray{T,2}
 # ============================================================
 # GPU Precision — use Float16 for 2x throughput on Intel Arc
 # ============================================================
-const E = Float16
+const E = Float32  # diagnostic: FP32 to isolate precision vs algorithmic divergence
 
 # ============================================================
 # Config
@@ -45,7 +45,7 @@ Base.@kwdef struct Qwen35GPUConfig
     num_attention_heads::Int = 8
     num_key_value_heads::Int = 2
     head_dim::Int = 256
-    rms_norm_eps::Float32 = 1.0e-6f0
+    rms_norm_eps::Float32 = 1.0f-6
     rope_theta::Float32 = 10000000.0f0
     max_position_embeddings::Int = 4096
     full_attention_interval::Int = 4
@@ -66,6 +66,7 @@ mutable struct AttentionLayer
     o_w::oneMatrix{E}
     q_norm::oneVector{E}
     k_norm::oneVector{E}
+    gate_w::oneMatrix{E}   # second half of wq: sigmoid-gate applied to attention output
 end
 
 mutable struct MLPLayer
@@ -79,14 +80,14 @@ mutable struct SSMLayer
     in_proj::oneMatrix{E}
     gate_proj::oneMatrix{E}
     ssm_out::oneMatrix{E}
-    ssm_conv1d::oneMatrix{E}
+    ssm_conv1d::oneMatrix{Float32}  # (conv_channels, conv_kernel) transposed; Float32 like state
     alpha_w::oneMatrix{E}
     beta_w::oneMatrix{E}
     ssm_a::oneVector{E}
     ssm_dt_bias::oneVector{E}
     ssm_norm_w::oneVector{E}
     # State buffers
-    conv_state::oneMatrix{E}
+    conv_state::oneArray{Float32, 2}  # (conv_channels, conv_kernel), Float32 like h_state
     h_state::oneArray{Float32, 3}  # Keep Float32 for SSM state (needs precision)
     # Dimensions
     d_inner::Int
@@ -95,6 +96,7 @@ mutable struct SSMLayer
     head_v_dim::Int
     head_k_dim::Int
     conv_channels::Int
+    conv_kernel::Int
 end
 
 mutable struct DecoderLayer
@@ -127,14 +129,19 @@ mutable struct Qwen35GPUModel
     qkv_buf::oneVector{E}
     attn_out::oneVector{E}
     gate_buf::oneVector{E}
+    gate_stack::oneVector{E}          # attention sigmoid gate
+    q_norm_buf::oneVector{<:AbstractFloat}   # per-head q norm (num_v_heads * head_k_dim)
+    k_norm_buf::oneVector{<:AbstractFloat}   # per-head k norm (num_v_heads * head_k_dim)
+    decay_buf::oneVector{<:AbstractFloat}    # delta-net decay (num_v_heads)
+    beta_gate_buf::oneVector{<:AbstractFloat} # delta-net beta gate (num_v_heads)
     up_buf::oneVector{E}
     out_buf::oneVector{E}
-    ssm_out_buf::oneVector{E}
+    ssm_out_buf::oneVector{<:AbstractFloat}  # delta-net y_all accumulation (Float32)
     score_buf::oneMatrix{E}
     q_buf::oneVector{E}
     k_buf::oneVector{E}
     v_buf::oneVector{E}
-    xz_buf::oneVector{E}
+    xz_buf::oneVector{<:AbstractFloat}       # in_proj raw + silu conv output (q/k/v source, Float32 for delta-net accuracy)
     gate_ssm_buf::oneVector{E}
     alpha_buf::oneVector{E}
     beta_buf::oneVector{E}
@@ -182,18 +189,19 @@ end
     idx = @index(Global, Linear)
     n_total = length(x)
     if idx <= n_total
-        half = head_dim ÷ 2
+        half = rotary_dim ÷ 2
         n_heads = n_total ÷ head_dim
         
         h = (idx - 1) ÷ head_dim  # 0-based head index
         d = (idx - 1) % head_dim  # 0-based dim index
         
-        # Only process first half (rotary dims)
-        if d < half && d < (rotary_dim ÷ 2)
+        # Only process first rotary_dim/2 dimensions (partial RoPE)
+        if d < half
             cp = cos[pos + 1, d + 1]
             sp = sin[pos + 1, d + 1]
             
-            # Pair indices: d and d + half
+            # Pair indices: d and d + half, where half = rotary_dim ÷ 2
+            # Matches CPU apply_rotary_emb! / rmsnorm_rotary! pairing
             i = h * head_dim + d + 1
             j = h * head_dim + half + d + 1
             
@@ -246,9 +254,11 @@ function attention_forward!(model::Qwen35GPUModel, layer::DecoderLayer, layer_id
     k = view(model.qkv_stack, (q_size+1):(q_size+k_size))
     v = view(model.qkv_stack, (q_size+k_size+1):total_qkv)
 
-    # L2 Q/K norm - GPUs native (no sync, no alloc)
-    fused_l2norm!(q, cfg.rms_norm_eps)
-    fused_l2norm!(k, cfg.rms_norm_eps)
+    # RMSNorm Q/K (matches CPU rmsnorm_rotary on q and k)
+    # q_norm / k_norm are per-head weight vectors (head_dim,), handled by
+    # rmsnorm_headed_gpu! below which normalizes each head separately.
+    rmsnorm_headed_gpu!(q, q, attn.q_norm, cfg.rms_norm_eps, head_dim)
+    rmsnorm_headed_gpu!(k, k, attn.k_norm, cfg.rms_norm_eps, head_dim)
 
     # RoPE - FULLY GPU
     rotary_dim = Int(head_dim * cfg.partial_rotary_factor)
@@ -260,11 +270,16 @@ function attention_forward!(model::Qwen35GPUModel, layer::DecoderLayer, layer_id
     v_cache = model.kv_cache_v[layer_idx]
 
     # Store KV cache - FULLY GPU (single kernel, no CPU loop)
-    write_kv_cache_gpu!(k_cache, v_cache, k, v, head_dim, pos-1)
+    write_kv_cache_gpu!(k_cache, v_cache, k, v, head_dim, pos)
 
     # Attention scores + softmax + weighted sum — fully FUSED (single kernel)
     seq_len = pos + 1
     fused_attention_forward!(model.attn_out, q, k_cache, v_cache, n_heads, head_dim, seq_len, n_groups)
+
+    # Apply the sigmoid gate from the query projection (matches CPU output gating)
+    mul!(model.gate_stack, attn.gate_w, hidden)
+    sigmoid_gpu!(model.gate_stack, model.gate_stack)
+    elementwise_mul!(model.attn_out, model.attn_out, model.gate_stack)
 
     # Output projection
     mul!(model.out_buf, attn.o_w, model.attn_out)
@@ -272,63 +287,69 @@ function attention_forward!(model::Qwen35GPUModel, layer::DecoderLayer, layer_id
 end
 
 # ============================================================
-# SSM Forward (Fully GPU - No CPU loops!)
+# SSM Forward (Fully GPU - Delta-net matches CPU GatedDeltaNetCPU exactly)
 # ============================================================
 function ssm_forward!(model::Qwen35GPUModel, layer::DecoderLayer, hidden::oneVector{E})
     ssm = layer.ssm
     cfg = model.config
-    h = cfg.hidden_size
-
-    d_inner = ssm.d_inner
-    n_v = ssm.num_v_heads
-    n_k = ssm.num_k_heads
-    head_v = ssm.head_v_dim
-    head_k = ssm.head_k_dim
     conv_channels = ssm.conv_channels
+    conv_kernel = ssm.conv_kernel
+    qk_size = ssm.head_k_dim * ssm.num_k_heads
 
-    # Combined in-projection
-    xz = model.xz_buf
-    mul!(xz, ssm.in_proj, hidden)
-    x_conv = view(xz, 1:conv_channels)
-    z = view(xz, conv_channels+1:conv_channels+d_inner)
+    # 1. Combined in-projection: xz = in_proj * hidden (conv_channels,)
+    mul!(model.xz_buf, ssm.in_proj, hidden)
 
-    # Gate
-    gate_out = model.gate_ssm_buf
-    mul!(gate_out, ssm.gate_proj, hidden)
-    silu_gpu!(gate_out, gate_out)
+    # 2. Conv1D: shift ring buffer, x_conv[c] = silu(dot(shifted_state, conv1d)),
+    #    store raw input at last column; xz now holds the silu-ed conv output
+    #    which is the source of q/k/v for the delta-net.
+    ssm_conv_kernel!(ssm.conv_state, ssm.ssm_conv1d, model.xz_buf,
+        conv_channels, conv_kernel)
 
-    # Conv1d: shift state, store new input
-    ssm.conv_state[:, 1:end-1] .= ssm.conv_state[:, 2:end]
-    ssm.conv_state[:, end] .= x_conv
+    # 3. Alpha/beta projections (num_v_heads,)
+    mul!(model.alpha_buf, ssm.alpha_w, hidden)
+    mul!(model.beta_buf, ssm.beta_w, hidden)
 
-    # Alpha/beta projections
-    alpha = model.alpha_buf
-    beta_all = model.beta_buf
-    mul!(alpha, ssm.alpha_w, hidden)
-    mul!(beta_all, ssm.beta_w, hidden)
+    # 4. Decay = exp(ssm_a * softplus(clamp(alpha + dt_bias))) and
+    #    beta_gate = sigmoid(clamp(beta)). Matches CPU clamp(-20,20) + softplus
+    #    semantics; the GPU vectors are copied to host (tiny buffers) then
+    #    copied back once the parameters are computed.
+    alpha_h = Array(model.alpha_buf)
+    beta_h = Array(model.beta_buf)
+    dt_bias_h = Array(ssm.ssm_dt_bias)
+    a_h = Array(ssm.ssm_a)
+    decay_h = Vector{Float32}(undef, ssm.num_v_heads)
+    bgate_h = Vector{Float32}(undef, ssm.num_v_heads)
+    for hh in 1:ssm.num_v_heads
+        av = clamp(alpha_h[hh] + dt_bias_h[hh], -20.0, 20.0)
+        decay_h[hh] = Float32(exp(a_h[hh] * log(1.0 + exp(av))))
+        bv = clamp(beta_h[hh], -20.0, 20.0)
+        bgate_h[hh] = Float32(1.0 / (1.0 + exp(-bv)))
+    end
+    copyto!(model.decay_buf, decay_h)
+    copyto!(model.beta_gate_buf, bgate_h)
 
-    # dt = sigmoid(dt_bias + alpha) — reuse alpha buffer (alpha is dead after this)
-    fused_ssm_gate_sigmoid!(alpha, ssm.ssm_dt_bias, alpha)
-    dt = alpha
+    # 5. Per-head L2 normalization of q and k (matches CPU: scale=1/sqrt(head_k_dim)
+    #    applies to q only; eps added after sqrt, as llama.cpp ggml_l2_norm).
+    ssm_qk_norm_kernel!(model.xz_buf, qk_size, ssm.head_k_dim,
+        ssm.num_k_heads, ssm.head_v_dim, ssm.num_v_heads, cfg.rms_norm_eps,
+        one(E) / sqrt(E(ssm.head_k_dim)), model.q_norm_buf, model.k_norm_buf)
 
-    # Decay = exp(-ssm_a * dt)
-    decay_buf = view(model.gate_buf, 1:length(dt))
-    fused_ssm_decay!(decay_buf, ssm.ssm_a, dt)
-    decay = decay_buf
+    # 6. Delta-net state update + y = state * q_norm (state after ger update)
+    ssm_state_kernel!(ssm.h_state, model.decay_buf, model.beta_gate_buf,
+        model.q_norm_buf, model.k_norm_buf, model.xz_buf, qk_size,
+        ssm.num_k_heads, ssm.head_k_dim, ssm.head_v_dim, ssm.num_v_heads, model.ssm_out_buf)
 
-    # State update - FULLY GPU (batched kernel)
-    batched_ssm_state_update!(ssm.h_state, decay, beta_all, x_conv, n_v, head_v, head_k)
+    # 7. Per-head RMSNorm on y (same RMSNorm weight applied to each head block)
+    ssm_y_norm_kernel!(model.ssm_out_buf, ssm.ssm_norm_w, cfg.rms_norm_eps,
+        ssm.num_v_heads, ssm.head_v_dim)
 
-    # SSM output sum - FULLY GPU (batched kernel)
-    y_all = view(model.ssm_out_buf, 1:d_inner)
-    batched_ssm_output_sum!(y_all, ssm.h_state, n_v, head_v, head_k)
+    # 8. Gate: y *= silu(gate_proj * x)  (matches CPU y_all *= silu(z))
+    mul!(model.gate_ssm_buf, ssm.gate_proj, hidden)
+    silu_gpu!(model.gate_ssm_buf, model.gate_ssm_buf)
+    elementwise_mul!(model.ssm_out_buf, model.ssm_out_buf, model.gate_ssm_buf)
 
-    # Gate output: fused SiLU + elementwise multiply (no temp, single kernel)
-    y_gated = view(model.ssm_out_buf, 1:d_inner)
-    fused_silu_gate_mul!(y_gated, y_all, gate_out)
-
-    # Output projection
-    mul!(model.out_buf, ssm.ssm_out, y_gated)
+    # 9. Output projection
+    mul!(model.out_buf, ssm.ssm_out, model.ssm_out_buf)
     return model.out_buf
 end
 
@@ -637,9 +658,9 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
     cos_cached_gpu = oneArray(cos_cached)
     sin_cached_gpu = oneArray(sin_cached)
 
-    # KV caches
-    kv_cache_k = [oneArray(zeros(E, head_dim * cfg.num_key_value_heads, max_seq_len)) for _ in 1:cfg.num_hidden_layers]
-    kv_cache_v = [oneArray(zeros(E, head_dim * cfg.num_key_value_heads, max_seq_len)) for _ in 1:cfg.num_hidden_layers]
+    # KV caches (expanded: one row-block per attention head, matching fused_attention_forward! indexing)
+    kv_cache_k = [oneArray(zeros(E, head_dim * cfg.num_attention_heads, max_seq_len)) for _ in 1:cfg.num_hidden_layers]
+    kv_cache_v = [oneArray(zeros(E, head_dim * cfg.num_attention_heads, max_seq_len)) for _ in 1:cfg.num_hidden_layers]
 
     # Work buffers
     model = Qwen35GPUModel(
@@ -657,7 +678,7 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
         residual = oneVector{E}(undef, h),
         norm_buf = oneVector{E}(undef, h),
         qkv_buf = oneVector{E}(undef, h),
-        attn_out = oneVector{E}(undef, h),
+        attn_out = oneVector{E}(undef, head_dim * cfg.num_attention_heads),
         gate_buf = oneVector{E}(undef, cfg.intermediate_size),
         up_buf = oneVector{E}(undef, cfg.intermediate_size),
         out_buf = oneVector{E}(undef, h),

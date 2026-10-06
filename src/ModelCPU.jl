@@ -63,7 +63,7 @@ Base.@kwdef struct QwenConfigCPU
  num_attention_heads::Int = 8
  num_key_value_heads::Int = 2
  head_dim::Int = 256
- rms_norm_eps::Float32 = 1e-6f0
+ rms_norm_eps::Float32 = 1.0f-6
  rope_theta::Float32 = 10000000.0f0
  max_position_embeddings::Int = 4096
  full_attention_interval::Int = 4

@@ -52,7 +52,7 @@ function standard_attention!(output::Vector{Float32},
     end
 end
 
-function verify_flash_attention(seq_len::Int; atol::Float32=1e-5f0)
+function verify_flash_attention(seq_len::Int; atol::Float32=1.0f-5)
     head_dim = 256
     n_kv_heads = 2
     kv_h = 1

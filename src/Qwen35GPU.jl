@@ -539,11 +539,16 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
     function gpu_tensor(name::String)
         info = GGUF.get_tensor(file, name)
         cpu_tensor = LoaderCPU.extract_tensor_cpu(file, info)
-        # Convert all CPU weights to GPU Float16
+        # Convert all CPU weights to GPU Float16, transposing matrices to matmul
+        # layout. This GGUF stores weight matrices as (in_features, out_features)
+        # row-major, exactly as the CPU path transposes them at load (matching the
+        # HuggingFace transformers weight layout used for CPU reference).
         if cpu_tensor isa Matrix{Float32}
-            return oneArray(E.(cpu_tensor))
+            w = permutedims(E.(cpu_tensor))
+            return oneArray(w)
         elseif cpu_tensor isa Matrix
-            return oneArray(E.(Matrix{Float32}(cpu_tensor)))
+            w = permutedims(E.(Matrix{Float32}(cpu_tensor)))
+            return oneArray(w)
         elseif cpu_tensor isa Vector{Float32}
             return oneArray(E.(cpu_tensor))
         elseif cpu_tensor isa Vector
@@ -558,32 +563,39 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
     # ===========================
     embed = gpu_tensor("token_embd.weight")
     final_norm_w = gpu_tensor("output_norm.weight")
-    lm_head = gpu_tensor("output.weight")
+    # Qwen3.5 ties word embeddings: output projection = token embedding (transpose the same tensor)
+    lm_head = embed
 
     layers = DecoderLayer[]
 
     for layer_idx in 1:cfg.num_hidden_layers
         prefix = "blk.$(layer_idx - 1)."
         
-        # Check if this is an full attention layer
-        is_attention = (layer_idx % cfg.full_attention_interval == 1)
+        # Check if this is a full-attention layer: blk.{3,7,11,15,19,23} are full attention
+        # (every 4th layer, 0-indexed) => 1-indexed: layer_idx % 4 == 0
+        is_attention = (layer_idx % cfg.full_attention_interval == 0)
         
         input_norm = gpu_tensor("$(prefix)attn_norm.weight")
-        post_norm = gpu_tensor("$(prefix)ffn_norm.weight")
+        post_norm = gpu_tensor("$(prefix)post_attention_norm.weight")
         
         if is_attention
-            # Load Q,K,V,O weights
+            # Qwen3 GGUF: attn_q.weight = [q; gate] (4096 = 8*256 + 8*256),
+            # attn_k.weight = (512, hidden), attn_v.weight = (512, hidden).
             q_w = gpu_tensor("$(prefix)attn_q.weight")
             k_w = gpu_tensor("$(prefix)attn_k.weight")
             v_w = gpu_tensor("$(prefix)attn_v.weight")
             o_w = gpu_tensor("$(prefix)attn_output.weight")
             
-            # Stack Q,K,V for batched matmul
+            # qkv_w = [q; k; v] for a single batched matmul (3x fewer launches)
             qkv_w = oneArray(vcat(oneAPI.Array(q_w), oneAPI.Array(k_w), oneAPI.Array(v_w)))
+            
+            # The second half of attn_q is the sigmoid gate applied to the
+            # attention output (matches CPU FullAttentionCPU gate_buf).
+            q_size = size(q_w, 1) ÷ 2
+            attn_gate = oneArray(oneAPI.Array(q_w)[(q_size + 1):(2 * q_size), :])
             
             q_norm = gpu_tensor("$(prefix)attn_q_norm.weight")
             k_norm = gpu_tensor("$(prefix)attn_k_norm.weight")
-            attn_gate = gpu_tensor("$(prefix)attn_gate.weight")
             
             attn_layer = AttentionLayer(qkv_w, q_w, k_w, v_w, o_w, q_norm, k_norm, attn_gate)
         else
@@ -601,15 +613,17 @@ function load_qwen35_gpu(gguf_path::String; gpu_device::Int=1, max_seq_len::Int=
         mlp_layer = MLPLayer(gate_up_w, gate_w, up_w, down_w)
         
         if !is_attention
-            # SSM weights
-            in_proj = gpu_tensor("$(prefix)ssm_in_proj.weight")
-            gate_proj = gpu_tensor("$(prefix)ssm_gate_proj.weight")
+            # Qwen3 GGUF uses unified naming: SSM in_proj = attn_qkv.weight,
+            # SSM gate_proj = attn_gate.weight. (CPU LoaderCPU.load_ssm_layer
+            # maps these names; the GPU path must use the same.)
+            in_proj = gpu_tensor("$(prefix)attn_qkv.weight")
+            gate_proj = gpu_tensor("$(prefix)attn_gate.weight")
             ssm_out = gpu_tensor("$(prefix)ssm_out.weight")
             ssm_conv1d = gpu_tensor("$(prefix)ssm_conv1d.weight")
             alpha_w = gpu_tensor("$(prefix)ssm_alpha.weight")
             beta_w = gpu_tensor("$(prefix)ssm_beta.weight")
-            ssm_a = gpu_tensor("$(prefix)ssm_a.weight")
-            ssm_dt_bias = gpu_tensor("$(prefix)ssm_dt_bias.weight")
+            ssm_a = gpu_tensor("$(prefix)ssm_a")
+            ssm_dt_bias = gpu_tensor("$(prefix)ssm_dt.bias")
             ssm_norm_w = gpu_tensor("$(prefix)ssm_norm.weight")
             
             # Determine SSM dimensions from tensor shapes (matches CPU load_ssm_layer)
